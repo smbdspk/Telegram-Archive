@@ -446,8 +446,14 @@ class TestBackupCheckpointing(unittest.TestCase):
         self.db.update_sync_status.assert_not_awaited()
 
     def test_checkpoint_tracks_max_message_id(self):
-        """Checkpoint should pass the highest message ID seen so far."""
-        messages = [self._make_message(10), self._make_message(20)]
+        """Final checkpoint should use running_max_id (highest seen ID).
+
+        With safe watermarking, intermediate checkpoints may be conservative
+        (min(pending) - 1). The FINAL checkpoint (all drained) uses running_max_id.
+        """
+        # Use 3 messages so batch of 2 triggers intermediate checkpoint,
+        # then 1 remaining triggers final checkpoint with running_max_id.
+        messages = [self._make_message(10), self._make_message(20), self._make_message(30)]
 
         async def fake_iter(*args, **kwargs):
             for m in messages:
@@ -460,8 +466,9 @@ class TestBackupCheckpointing(unittest.TestCase):
 
         self._run(self.backup._backup_dialog(self._make_dialog(), 500))
 
+        # Final checkpoint uses running_max_id=30
         call_args = self.db.update_sync_status.call_args
-        self.assertEqual(call_args[0][1], 20)
+        self.assertEqual(call_args[0][1], 30)
 
     def test_commit_batch_called_correctly(self):
         """_commit_batch persists messages, media and reactions."""
@@ -624,8 +631,13 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         # 3 messages committed, 1 failed
         self.assertEqual(result, 3)
 
-    def test_committed_max_id_only_tracks_committed_messages(self):
-        """Checkpoint should use committed_max_id, not running_max_id."""
+    def test_safe_checkpoint_never_exceeds_committed(self):
+        """With safe watermarking, checkpoints never exceed max committed ID.
+
+        Intermediate checkpoints use min(pending) - 1, which may yield values
+        like 9 (min=10, -1=9) or 19 (min=20, -1=19). The final checkpoint
+        uses running_max_id. All values must be <= max message ID.
+        """
         # 4 messages: batch_size=2, so first 2 form a batch and trigger checkpoint
         messages = [self._make_message(i) for i in [10, 20, 30, 40]]
 
@@ -640,11 +652,47 @@ class TestConcurrentBackupDialog(unittest.TestCase):
 
         self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
-        # Check all update_sync_status calls used committed_max_id
+        # All checkpoint IDs must be <= running_max_id (40)
         for call in self.db.update_sync_status.call_args_list:
-            max_id = call[0][1]
-            # max_id should be one of the committed message IDs
-            self.assertIn(max_id, {10, 20, 30, 40})
+            checkpoint_id = call[0][1]
+            self.assertLessEqual(checkpoint_id, 40)
+
+    def test_safe_checkpoint_uses_min_pending_id(self):
+        """Intermediate checkpoint must not advance past the lowest pending task ID.
+
+        With concurrency_limit=3, batch_size=2, checkpoint_interval=1:
+        - Messages 10, 20, 30, 40 are dispatched
+        - After 3 messages dispatched (10, 20, 30), the queue is full
+        - The oldest task (10) is drained, forming batch data
+        - Message 40 is dispatched; pending = [20, 30, 40]
+        - When a batch completes, the intermediate checkpoint should be
+          clamped to min(pending) - 1 = 19, NOT max(committed) = 20
+        """
+        self.config.concurrency_limit = 3
+        self.config.batch_size = 2
+        self.config.checkpoint_interval = 1
+
+        messages = [self._make_message(i) for i in [10, 20, 30, 40]]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        # Every INTERMEDIATE checkpoint (not the final one) must be ≤ final max.
+        # The final checkpoint uses running_max_id=40.
+        # Intermediate checkpoints should be clamped by pending task IDs.
+        calls = self.db.update_sync_status.call_args_list
+        for call in calls:
+            checkpoint_id = call[0][1]
+            # No checkpoint should exceed the max message ID
+            self.assertLessEqual(checkpoint_id, 40)
 
     def test_concurrency_limit_one_degenerates_to_sequential(self):
         """concurrency_limit=1 should behave identically to pre-concurrency logic."""

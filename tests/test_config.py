@@ -1391,6 +1391,20 @@ class TestConcurrencyLimit(unittest.TestCase):
             config = Config()
             self.assertEqual(config.concurrency_limit, 1)
 
+    def test_concurrency_limit_empty_string_uses_default(self):
+        """CONCURRENCY_LIMIT='' falls back to default 4."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 4)
+
+    def test_concurrency_limit_non_numeric_uses_default(self):
+        """CONCURRENCY_LIMIT='auto' falls back to default 4."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "auto", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 4)
+
 
 class TestPreserveOrder(unittest.TestCase):
     """Test PRESERVE_ORDER configuration for message commit ordering."""

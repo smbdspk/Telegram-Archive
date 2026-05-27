@@ -1103,6 +1103,86 @@ class TestFillGapRange(unittest.TestCase):
         self.assertEqual(result, 0)
 
 
+class TestRecoverTrailingGaps(unittest.TestCase):
+    """Test _recover_trailing_gaps cursor recovery."""
+
+    def setUp(self):
+        self.backup = _make_backup()
+
+    def test_no_trailing_gaps_does_nothing(self):
+        """When no trailing gaps detected, no cursors are reset."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(return_value=[])
+
+        summary = _run(self.backup._recover_trailing_gaps())
+
+        self.assertEqual(summary["chats_fixed"], 0)
+        self.backup.db.reset_sync_cursor.assert_not_awaited()
+
+    def test_trailing_gap_resets_cursor(self):
+        """Detected trailing gap resets cursor to actual_max."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(
+            return_value=[{"chat_id": 100, "cursor": 500, "actual_max": 450, "trailing_gap": 50}]
+        )
+        self.backup.db.reset_sync_cursor = AsyncMock()
+
+        summary = _run(self.backup._recover_trailing_gaps())
+
+        self.assertEqual(summary["chats_fixed"], 1)
+        self.assertEqual(summary["total_trailing_gap"], 50)
+        self.backup.db.reset_sync_cursor.assert_awaited_once_with(100, 450)
+
+    def test_multiple_trailing_gaps(self):
+        """Multiple chats with trailing gaps are all fixed."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(
+            return_value=[
+                {"chat_id": 100, "cursor": 500, "actual_max": 450, "trailing_gap": 50},
+                {"chat_id": 200, "cursor": 1000, "actual_max": 980, "trailing_gap": 20},
+            ]
+        )
+        self.backup.db.reset_sync_cursor = AsyncMock()
+
+        summary = _run(self.backup._recover_trailing_gaps())
+
+        self.assertEqual(summary["chats_fixed"], 2)
+        self.assertEqual(summary["total_trailing_gap"], 70)
+        self.assertEqual(self.backup.db.reset_sync_cursor.await_count, 2)
+
+    def test_detect_trailing_gaps_error_does_not_crash(self):
+        """Exception in detect_trailing_gaps is caught."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(side_effect=Exception("db error"))
+
+        summary = _run(self.backup._recover_trailing_gaps())
+
+        self.assertEqual(summary["chats_fixed"], 0)
+
+    def test_reset_cursor_error_does_not_crash(self):
+        """Exception resetting one cursor doesn't crash the whole recovery."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(
+            return_value=[{"chat_id": 100, "cursor": 500, "actual_max": 450, "trailing_gap": 50}]
+        )
+        self.backup.db.reset_sync_cursor = AsyncMock(side_effect=Exception("db locked"))
+
+        summary = _run(self.backup._recover_trailing_gaps())
+
+        # Failed to fix, so chats_fixed stays 0
+        self.assertEqual(summary["chats_fixed"], 0)
+
+    def test_fill_gaps_integrates_trailing_recovery(self):
+        """_fill_gaps calls _recover_trailing_gaps and includes results in summary."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(
+            return_value=[{"chat_id": 100, "cursor": 500, "actual_max": 450, "trailing_gap": 50}]
+        )
+        self.backup.db.reset_sync_cursor = AsyncMock()
+        self.backup.db.detect_message_gaps = AsyncMock(return_value=[])
+        self.backup.client.get_entity = AsyncMock(return_value=MagicMock())
+        self.backup._get_chat_name = MagicMock(return_value="TestChat")
+
+        summary = _run(self.backup._fill_gaps(chat_id=100))
+
+        self.assertEqual(summary["trailing_gaps_fixed"], 1)
+        self.assertEqual(summary["trailing_gap_ids"], 50)
+
+
 # ===========================================================================
 # _backup_forum_topics fallback / emoji paths (lines 1650-1661, 1692-1693,
 #   1704-1735)

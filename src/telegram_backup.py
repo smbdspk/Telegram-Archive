@@ -935,15 +935,32 @@ class TelegramBackup:
         batches_since_checkpoint = 0
         running_max_id = last_message_id
         # Tracks the max message ID that has actually been committed to the DB.
-        # Used for checkpoint writes so a crash never advances past uncommitted data.
+        # Only used for the FINAL checkpoint after all tasks have drained.
         committed_max_id = last_message_id
 
         # Limit for concurrent _process_message tasks per chat
         concurrency_limit = self.config.concurrency_limit
-        pending_tasks: list[asyncio.Task] = []
+        # Each entry is (message_id, task) so we can compute a safe checkpoint.
+        pending_tasks: list[tuple[int, asyncio.Task]] = []
 
         # When True, messages are committed in Telegram ID order even under concurrency.
         preserve_order = self.config.preserve_order
+
+        def _safe_checkpoint_id() -> int:
+            """Return the highest message ID that is safe to persist as a checkpoint.
+
+            While tasks are in-flight, the checkpoint must not advance past
+            the lowest pending message ID (minus 1), because those messages
+            have not been committed to the DB yet.  A crash after an
+            over-advanced checkpoint would permanently skip them on restart.
+            """
+            if pending_tasks:
+                lowest_pending = min(msg_id for msg_id, _ in pending_tasks)
+                # We can only guarantee messages below the lowest pending
+                # task have been committed. Subtract 1 because min_id in
+                # iter_messages is exclusive.
+                return max(last_message_id, lowest_pending - 1)
+            return committed_max_id
 
         # Local helper: append processed data and flush/checkpoint when batch is full.
         # Only called from the main coroutine (never concurrently), so nonlocal state is safe.
@@ -963,14 +980,16 @@ class TelegramBackup:
                 logger.info(f"  → Processed {grand_total} messages...")
 
                 if batches_since_checkpoint >= checkpoint_interval:
-                    await self.db.update_sync_status(chat_id, committed_max_id, uncheckpointed_count)
+                    safe_id = _safe_checkpoint_id()
+                    await self.db.update_sync_status(chat_id, safe_id, uncheckpointed_count)
                     uncheckpointed_count = 0
                     batches_since_checkpoint = 0
 
                 batch_data = []
 
-        async def _drain_task(task: asyncio.Task) -> bool:
+        async def _drain_task(task_entry: tuple[int, asyncio.Task]) -> bool:
             """Await a single task and commit its result. Returns True on success."""
+            _msg_id, task = task_entry
             try:
                 msg_data = await task
                 await _append_and_commit(msg_data)
@@ -995,37 +1014,44 @@ class TelegramBackup:
                         await _drain_task(pending_tasks.pop(0))
                     else:
                         # FASTEST FIRST: Wait for ANY task that finishes first
+                        task_map = {t: (mid, t) for mid, t in pending_tasks}
                         done, pending = await asyncio.wait(
-                            pending_tasks,
+                            [t for _, t in pending_tasks],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        pending_tasks = list(pending)
+                        # Rebuild pending_tasks preserving (msg_id, task) pairing
+                        pending_tasks = [task_map[t] for t in pending]
                         for completed_task in done:
-                            await _drain_task(completed_task)
+                            await _drain_task(task_map[completed_task])
 
                 # Create a background task for processing, allowing concurrent execution
                 task = asyncio.create_task(self._process_message(message, chat_id))
-                pending_tasks.append(task)
+                pending_tasks.append((message.id, task))
 
             # Drain all remaining pending tasks
             if pending_tasks:
                 if preserve_order:
-                    for task in pending_tasks:
-                        await _drain_task(task)
+                    for task_entry in pending_tasks:
+                        await _drain_task(task_entry)
                 else:
-                    for coro in asyncio.as_completed(pending_tasks):
-                        try:
-                            msg_data = await coro
-                            await _append_and_commit(msg_data)
-                        except Exception as exc:
-                            logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
+                    # Drain in completion order for fastest-first mode
+                    remaining = list(pending_tasks)
+                    while remaining:
+                        task_map = {t: (mid, t) for mid, t in remaining}
+                        done, pending = await asyncio.wait(
+                            [t for _, t in remaining],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        remaining = [task_map[t] for t in pending]
+                        for completed_task in done:
+                            await _drain_task(task_map[completed_task])
                 pending_tasks.clear()
 
         finally:
             # Cancel any in-flight tasks on unexpected exit (e.g. FloodWaitError propagation)
-            for task in pending_tasks:
+            for _msg_id, task in pending_tasks:
                 task.cancel()
-            for task in pending_tasks:
+            for _msg_id, task in pending_tasks:
                 try:
                     await task
                 except asyncio.CancelledError, Exception:
@@ -1041,6 +1067,7 @@ class TelegramBackup:
         # Final checkpoint: persist when there are un-checkpointed messages OR
         # when the cursor advanced purely from skipped (topic-filtered) messages
         # that were never counted in uncheckpointed_count.
+        # At this point all tasks are drained, so committed_max_id is safe to use.
         if uncheckpointed_count > 0 or (grand_total == 0 and running_max_id > last_message_id):
             await self.db.update_sync_status(chat_id, running_max_id, uncheckpointed_count)
 
@@ -1117,9 +1144,63 @@ class TelegramBackup:
 
         return recovered
 
+    async def _recover_trailing_gaps(self) -> dict:
+        """Detect and fix sync cursors that advanced past committed messages.
+
+        When concurrent backups checkpoint a message ID before all in-flight
+        tasks have committed, a crash can leave the cursor ahead of actual data.
+        On restart, get_last_message_id returns the over-advanced cursor and
+        iter_messages(min_id=cursor) skips the uncommitted range permanently.
+
+        This method detects those chats and resets their cursors so the next
+        regular backup re-fetches the missing messages.
+
+        Returns:
+            Summary dict with recovery statistics.
+        """
+        summary = {"chats_fixed": 0, "total_trailing_gap": 0, "details": []}
+
+        try:
+            trailing_gaps = await self.db.detect_trailing_gaps()
+        except Exception as e:
+            logger.error(f"Trailing-gap recovery: failed to query: {e}")
+            return summary
+
+        if not trailing_gaps:
+            logger.info("Trailing-gap recovery: no over-advanced cursors found")
+            return summary
+
+        logger.warning(
+            f"Trailing-gap recovery: found {len(trailing_gaps)} chat(s) with sync cursor ahead of committed data"
+        )
+
+        for gap in trailing_gaps:
+            cid = gap["chat_id"]
+            cursor = gap["cursor"]
+            actual_max = gap["actual_max"]
+            trailing = gap["trailing_gap"]
+
+            logger.warning(
+                f"  → Resetting cursor: cursor={cursor} → {actual_max} (trailing gap of {trailing} message IDs)"
+            )
+
+            try:
+                await self.db.reset_sync_cursor(cid, actual_max)
+                summary["chats_fixed"] += 1
+                summary["total_trailing_gap"] += trailing
+                summary["details"].append(gap)
+            except Exception as e:
+                logger.error(f"  → Failed to reset cursor for chat {cid}: {e}")
+
+        return summary
+
     async def _fill_gaps(self, chat_id: int | None = None) -> dict:
         """
         Detect and fill gaps in message ID sequences.
+
+        First runs trailing-gap recovery to fix sync cursors that advanced
+        past committed data (from concurrent checkpoint bugs). Then scans
+        for interior gaps in the message ID sequence.
 
         Scans chats for missing message ID ranges and fetches them from Telegram.
 
@@ -1129,6 +1210,9 @@ class TelegramBackup:
         Returns:
             Summary dict with gap-fill statistics.
         """
+        # Phase 0: Recover trailing gaps (cursor over-advancement)
+        trailing_summary = await self._recover_trailing_gaps()
+
         threshold = self.config.gap_threshold
         summary = {
             "chats_scanned": 0,
@@ -1136,6 +1220,8 @@ class TelegramBackup:
             "total_gaps": 0,
             "total_recovered": 0,
             "errors": 0,
+            "trailing_gaps_fixed": trailing_summary["chats_fixed"],
+            "trailing_gap_ids": trailing_summary["total_trailing_gap"],
             "details": [],
         }
 

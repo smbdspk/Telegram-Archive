@@ -1018,6 +1018,56 @@ class DatabaseAdapter:
 
     # ========== Gap Detection ==========
 
+    @retry_on_locked()
+    async def detect_trailing_gaps(self) -> list[dict]:
+        """Detect chats where sync cursor has advanced past actual committed messages.
+
+        This happens when a concurrent backup checkpoints a high message ID
+        while lower-ID tasks are still in-flight, and a crash prevents those
+        tasks from completing. On restart, get_last_message_id returns the
+        over-advanced cursor, permanently skipping the uncommitted messages.
+
+        Returns:
+            List of dicts with chat_id, cursor (sync_status.last_message_id),
+            actual_max (MAX(messages.id)), and trailing_gap size.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT ss.chat_id,
+                           ss.last_message_id AS cursor,
+                           MAX(m.id) AS actual_max,
+                           ss.last_message_id - MAX(m.id) AS trailing_gap
+                    FROM sync_status ss
+                    JOIN messages m ON m.chat_id = ss.chat_id
+                    GROUP BY ss.chat_id
+                    HAVING ss.last_message_id > MAX(m.id)
+                    """
+                )
+            )
+            return [
+                {
+                    "chat_id": row[0],
+                    "cursor": row[1],
+                    "actual_max": row[2],
+                    "trailing_gap": row[3],
+                }
+                for row in result.fetchall()
+            ]
+
+    @retry_on_locked()
+    async def reset_sync_cursor(self, chat_id: int, new_last_message_id: int) -> None:
+        """Reset sync cursor to a lower value, allowing re-fetch of skipped messages.
+
+        Used by trailing-gap recovery to fix over-advanced cursors caused by
+        concurrent checkpoint bugs.
+        """
+        async with self.db_manager.async_session_factory() as session:
+            stmt = update(SyncStatus).where(SyncStatus.chat_id == chat_id).values(last_message_id=new_last_message_id)
+            await session.execute(stmt)
+            await session.commit()
+
     async def detect_message_gaps(self, chat_id: int, threshold: int = 50) -> list[tuple[int, int, int]]:
         """Detect gaps in message ID sequences for a chat.
 
