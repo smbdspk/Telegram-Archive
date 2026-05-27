@@ -1347,5 +1347,95 @@ class TestProxyMissingAddr(unittest.TestCase):
             self.assertIn("TELEGRAM_PROXY_ADDR", str(ctx.exception))
 
 
+class TestConcurrencyLimit(unittest.TestCase):
+    """Test CONCURRENCY_LIMIT configuration for parallel message processing."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_concurrency_limit_default(self):
+        """CONCURRENCY_LIMIT defaults to 4 when not set."""
+        env_vars = {"CHAT_TYPES": "private", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 4)
+
+    def test_concurrency_limit_custom(self):
+        """Can configure a custom concurrency limit."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "8", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 8)
+
+    def test_concurrency_limit_minimum_one(self):
+        """CONCURRENCY_LIMIT is clamped to minimum of 1."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "0", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 1)
+
+    def test_concurrency_limit_negative_clamped(self):
+        """Negative CONCURRENCY_LIMIT is clamped to 1."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "-5", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 1)
+
+    def test_concurrency_limit_one(self):
+        """CONCURRENCY_LIMIT=1 means sequential processing."""
+        env_vars = {"CHAT_TYPES": "private", "CONCURRENCY_LIMIT": "1", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertEqual(config.concurrency_limit, 1)
+
+
+class TestPreserveOrder(unittest.TestCase):
+    """Test PRESERVE_ORDER configuration for message commit ordering."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_preserve_order_default_true(self):
+        """PRESERVE_ORDER defaults to True when not set."""
+        env_vars = {"CHAT_TYPES": "private", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertTrue(config.preserve_order)
+
+    def test_preserve_order_false(self):
+        """PRESERVE_ORDER=false disables ordered commits."""
+        env_vars = {"CHAT_TYPES": "private", "PRESERVE_ORDER": "false", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertFalse(config.preserve_order)
+
+    def test_preserve_order_true_explicit(self):
+        """PRESERVE_ORDER=true explicitly enables ordered commits."""
+        env_vars = {"CHAT_TYPES": "private", "PRESERVE_ORDER": "true", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertTrue(config.preserve_order)
+
+    def test_preserve_order_case_insensitive(self):
+        """PRESERVE_ORDER parsing is case insensitive."""
+        env_vars = {"CHAT_TYPES": "private", "PRESERVE_ORDER": "FALSE", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertFalse(config.preserve_order)
+
+    def test_preserve_order_true_case_insensitive(self):
+        """PRESERVE_ORDER=TRUE is recognized."""
+        env_vars = {"CHAT_TYPES": "private", "PRESERVE_ORDER": "TRUE", "BACKUP_PATH": self.temp_dir}
+        with patch.dict(os.environ, env_vars, clear=True):
+            config = Config()
+            self.assertTrue(config.preserve_order)
+
+
 if __name__ == "__main__":
     unittest.main()

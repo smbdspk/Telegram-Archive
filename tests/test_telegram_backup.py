@@ -325,6 +325,8 @@ class TestBackupCheckpointing(unittest.TestCase):
         self.config = MagicMock()
         self.config.batch_size = 2
         self.config.checkpoint_interval = 1
+        self.config.concurrency_limit = 1
+        self.config.preserve_order = True
         self.config.skip_media_chat_ids = set()
         self.config.skip_media_delete_existing = False
         self.config.sync_deletions_edits = False
@@ -482,6 +484,195 @@ class TestBackupCheckpointing(unittest.TestCase):
         backup.db.insert_reactions.assert_awaited_once()
 
 
+class TestConcurrentBackupDialog(unittest.TestCase):
+    """Test _backup_dialog with concurrency_limit > 1."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+        self.config = MagicMock()
+        self.config.batch_size = 2
+        self.config.checkpoint_interval = 1
+        self.config.concurrency_limit = 3
+        self.config.preserve_order = True
+        self.config.skip_media_chat_ids = set()
+        self.config.skip_media_delete_existing = False
+        self.config.sync_deletions_edits = False
+        self.config.should_skip_topic = MagicMock(return_value=False)
+        self.config.media_path = os.path.join(self.temp_dir, "media")
+
+        self.db = AsyncMock()
+        self.db.get_last_message_id.return_value = 0
+
+        self.backup = TelegramBackup.__new__(TelegramBackup)
+        self.backup.config = self.config
+        self.backup.db = self.db
+        self.backup.client = MagicMock()
+        self.backup._cleaned_media_chats = set()
+        self.backup._get_marked_id = MagicMock(return_value=100)
+        self.backup._extract_chat_data = MagicMock(return_value={"id": 100})
+        self.backup._ensure_profile_photo = AsyncMock()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _make_dialog(self):
+        dialog = MagicMock()
+        dialog.entity = MagicMock()
+        return dialog
+
+    def _make_message(self, msg_id):
+        msg = MagicMock()
+        msg.id = msg_id
+        msg.reply_to = None
+        return msg
+
+    def test_concurrent_preserve_order_processes_all_messages(self):
+        """With concurrency_limit=3 and preserve_order=True, all messages are processed."""
+        messages = [self._make_message(i) for i in range(1, 7)]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        self.assertEqual(result, 6)
+        self.assertEqual(self.backup._process_message.await_count, 6)
+
+    def test_concurrent_fastest_first_processes_all_messages(self):
+        """With preserve_order=False, all messages are still processed."""
+        self.config.preserve_order = False
+        messages = [self._make_message(i) for i in range(1, 7)]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        self.assertEqual(result, 6)
+        self.assertEqual(self.backup._process_message.await_count, 6)
+
+    def test_concurrent_error_skips_failed_message(self):
+        """When a task raises, the error is logged and processing continues."""
+        messages = [self._make_message(i) for i in range(1, 5)]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        call_count = 0
+
+        async def process_with_error(m, c):
+            nonlocal call_count
+            call_count += 1
+            if m.id == 2:
+                raise RuntimeError("simulated download error")
+            return {"id": m.id, "chat_id": c}
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = process_with_error
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        # Should NOT raise — error is caught and message skipped
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        # 3 messages committed (IDs 1, 3, 4), 1 skipped (ID 2)
+        self.assertEqual(result, 3)
+        self.assertEqual(call_count, 4)
+
+    def test_concurrent_error_in_fastest_first_mode(self):
+        """Error handling also works in preserve_order=False mode."""
+        self.config.preserve_order = False
+        messages = [self._make_message(i) for i in range(1, 5)]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        async def process_with_error(m, c):
+            if m.id == 3:
+                raise RuntimeError("simulated error")
+            return {"id": m.id, "chat_id": c}
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = process_with_error
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        # 3 messages committed, 1 failed
+        self.assertEqual(result, 3)
+
+    def test_committed_max_id_only_tracks_committed_messages(self):
+        """Checkpoint should use committed_max_id, not running_max_id."""
+        # 4 messages: batch_size=2, so first 2 form a batch and trigger checkpoint
+        messages = [self._make_message(i) for i in [10, 20, 30, 40]]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        # Check all update_sync_status calls used committed_max_id
+        for call in self.db.update_sync_status.call_args_list:
+            max_id = call[0][1]
+            # max_id should be one of the committed message IDs
+            self.assertIn(max_id, {10, 20, 30, 40})
+
+    def test_concurrency_limit_one_degenerates_to_sequential(self):
+        """concurrency_limit=1 should behave identically to pre-concurrency logic."""
+        self.config.concurrency_limit = 1
+        messages = [self._make_message(i) for i in range(1, 5)]
+
+        processed_order = []
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        async def track_process(m, c):
+            processed_order.append(m.id)
+            return {"id": m.id, "chat_id": c}
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = track_process
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        self.assertEqual(result, 4)
+        # With concurrency_limit=1 and preserve_order=True, order is sequential
+        self.assertEqual(processed_order, [1, 2, 3, 4])
+
+
 class TestTopicFilteringInBackupDialog(unittest.TestCase):
     """Test that _backup_dialog respects SKIP_TOPIC_IDS filtering."""
 
@@ -491,6 +682,8 @@ class TestTopicFilteringInBackupDialog(unittest.TestCase):
         self.config = MagicMock()
         self.config.batch_size = 100
         self.config.checkpoint_interval = 1
+        self.config.concurrency_limit = 1
+        self.config.preserve_order = True
         self.config.skip_media_chat_ids = set()
         self.config.skip_media_delete_existing = False
         self.config.sync_deletions_edits = False

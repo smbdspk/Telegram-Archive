@@ -935,16 +935,25 @@ class TelegramBackup:
         uncheckpointed_count = 0
         batches_since_checkpoint = 0
         running_max_id = last_message_id
+        # Tracks the max message ID that has actually been committed to the DB.
+        # Used for checkpoint writes so a crash never advances past uncommitted data.
+        committed_max_id = last_message_id
 
-        async for message in iter_messages_with_flood_retry(self.client, entity, min_id=last_message_id, reverse=True):
-            running_max_id = max(running_max_id, message.id)
+        # Limit for concurrent _process_message tasks per chat
+        concurrency_limit = self.config.concurrency_limit
+        pending_tasks: list[asyncio.Task] = []
 
-            # Skip messages belonging to excluded forum topics
-            if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
-                continue
+        # When True, messages are committed in Telegram ID order even under concurrency.
+        preserve_order = self.config.preserve_order
 
-            msg_data = await self._process_message(message, chat_id)
+        # Local helper: append processed data and flush/checkpoint when batch is full.
+        # Only called from the main coroutine (never concurrently), so nonlocal state is safe.
+        async def _append_and_commit(msg_data):
+            nonlocal batch_data, grand_total, uncheckpointed_count
+            nonlocal batches_since_checkpoint, committed_max_id
+
             batch_data.append(msg_data)
+            committed_max_id = max(committed_max_id, msg_data["id"])
 
             if len(batch_data) >= batch_size:
                 await self._commit_batch(batch_data, chat_id)
@@ -955,11 +964,73 @@ class TelegramBackup:
                 logger.info(f"  → Processed {grand_total} messages...")
 
                 if batches_since_checkpoint >= checkpoint_interval:
-                    await self.db.update_sync_status(chat_id, running_max_id, uncheckpointed_count)
+                    await self.db.update_sync_status(chat_id, committed_max_id, uncheckpointed_count)
                     uncheckpointed_count = 0
                     batches_since_checkpoint = 0
 
                 batch_data = []
+
+        async def _drain_task(task: asyncio.Task) -> bool:
+            """Await a single task and commit its result. Returns True on success."""
+            try:
+                msg_data = await task
+                await _append_and_commit(msg_data)
+                return True
+            except Exception as exc:
+                logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
+                return False
+
+        try:
+            async for message in iter_messages_with_flood_retry(
+                self.client, entity, min_id=last_message_id, reverse=True
+            ):
+                running_max_id = max(running_max_id, message.id)
+
+                # Skip messages belonging to excluded forum topics
+                if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
+                    continue
+
+                if len(pending_tasks) >= concurrency_limit:
+                    if preserve_order:
+                        # STRICT ORDER: Wait for the oldest task
+                        await _drain_task(pending_tasks.pop(0))
+                    else:
+                        # FASTEST FIRST: Wait for ANY task that finishes first
+                        done, pending = await asyncio.wait(
+                            pending_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        pending_tasks = list(pending)
+                        for completed_task in done:
+                            await _drain_task(completed_task)
+
+                # Create a background task for processing, allowing concurrent execution
+                task = asyncio.create_task(self._process_message(message, chat_id))
+                pending_tasks.append(task)
+
+            # Drain all remaining pending tasks
+            if pending_tasks:
+                if preserve_order:
+                    for task in pending_tasks:
+                        await _drain_task(task)
+                else:
+                    for coro in asyncio.as_completed(pending_tasks):
+                        try:
+                            msg_data = await coro
+                            await _append_and_commit(msg_data)
+                        except Exception as exc:
+                            logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
+                pending_tasks.clear()
+
+        finally:
+            # Cancel any in-flight tasks on unexpected exit (e.g. FloodWaitError propagation)
+            for task in pending_tasks:
+                task.cancel()
+            for task in pending_tasks:
+                try:
+                    await task
+                except asyncio.CancelledError, Exception:
+                    pass
 
         # Flush remaining messages
         if batch_data:

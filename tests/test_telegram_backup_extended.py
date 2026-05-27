@@ -37,6 +37,8 @@ def _make_backup(**overrides):
     backup = TelegramBackup.__new__(TelegramBackup)
     backup.config = overrides.get("config", MagicMock())
     backup.config.should_skip_topic = MagicMock(return_value=False)
+    backup.config.concurrency_limit = 1
+    backup.config.preserve_order = True
     backup.db = overrides.get("db", AsyncMock())
     backup.client = overrides.get("client", AsyncMock())
     backup._owns_client = overrides.get("_owns_client", True)

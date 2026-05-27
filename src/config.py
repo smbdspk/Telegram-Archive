@@ -120,6 +120,15 @@ class Config:
         # Lower = better crash recovery, higher = fewer DB writes
         self.checkpoint_interval = max(1, int(os.getenv("CHECKPOINT_INTERVAL", "1")))
 
+        # Max concurrent _process_message tasks per chat during backup.
+        # Higher values speed up media-heavy chats but increase DB/API pressure.
+        self.concurrency_limit = max(1, int(os.getenv("CONCURRENCY_LIMIT", "4")))
+
+        # When True, messages are committed to the DB in Telegram ID order
+        # even when processed concurrently. When False, fastest-first ordering
+        # is used (slightly faster, but messages appear out of order in DB).
+        self.preserve_order = os.getenv("PRESERVE_ORDER", "true").lower() == "true"
+
         # Database Configuration
         # Timeout for SQLite operations (seconds).
         # Increase this if you experience "database is locked" errors (e.g., on Unraid/slow disks).

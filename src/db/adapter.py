@@ -351,6 +351,7 @@ class DatabaseAdapter:
 
     # ========== User Operations ==========
 
+    @retry_on_locked()
     async def upsert_user(self, user_data: dict[str, Any]) -> None:
         """Insert or update a user record."""
         async with self.db_manager.async_session_factory() as session:
@@ -644,6 +645,7 @@ class DatabaseAdapter:
 
     # ========== Media Operations ==========
 
+    @retry_on_locked()
     async def insert_media(self, media_data: dict[str, Any]) -> None:
         """Insert a media file record."""
         async with self.db_manager.async_session_factory() as session:
