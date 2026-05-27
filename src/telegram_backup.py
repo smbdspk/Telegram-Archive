@@ -7,6 +7,7 @@ import asyncio
 import base64
 import logging
 import os
+import random
 from datetime import UTC, datetime
 
 from telethon import TelegramClient
@@ -14,6 +15,7 @@ from telethon.errors import (
     ChannelPrivateError,
     ChatForbiddenError,
     FloodWaitError,
+    RPCError,
     UserBannedInChannelError,
 )
 from telethon.tl.types import (
@@ -106,7 +108,8 @@ def _pre_generate_thumbnail(source_path: str, media_root: str) -> None:
 
 
 async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, **kwargs):
-    """Retry a single async call on FloodWaitError with bounded sleep.
+    """Retry a single async call on FloodWaitError with bounded sleep and
+    general transient errors with configurable exponential backoff and jitter.
 
     Use this for one-shot Telegram API calls (``get_dialogs``, ``get_me``, etc.)
     that are not async iterators.  For ``iter_messages`` use
@@ -134,14 +137,58 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
                 )
                 raise
             wait_seconds = max(0, e.seconds)
+            # Randomized jitter buffer between 0.5 and 2.0 seconds
+            jitter = random.uniform(0.5, 2.0)
+            sleep_duration = wait_seconds + jitter
             logger.warning(
-                "FloodWait: sleeping %ss before retrying %s (retry=%d/%d)",
+                "FloodWait: sleeping %.2fs (wait=%ss, jitter=%.2fs) before retrying %s (retry=%d/%d)",
+                sleep_duration,
                 wait_seconds,
+                jitter,
                 getattr(coro_fn, "__name__", coro_fn),
                 retries,
                 max_retries,
             )
-            await asyncio.sleep(wait_seconds + 1)  # +1s buffer to avoid boundary re-trigger
+            await asyncio.sleep(sleep_duration)
+        except (TimeoutError, ConnectionError, OSError, RPCError) as exc:
+            # If it is a FloodWaitError, raise it to let the prior except block catch it specifically
+            if isinstance(exc, FloodWaitError):
+                raise exc
+
+            retries += 1
+            if retries > max_retries:
+                logger.error(
+                    "Transient Error: exceeded %d retries on %s, giving up: %s",
+                    max_retries,
+                    getattr(coro_fn, "__name__", coro_fn),
+                    exc,
+                )
+                raise
+
+            try:
+                backoff_min = float(os.getenv("BACKOFF_MIN_SECONDS", "2.0"))
+            except ValueError, TypeError:
+                backoff_min = 2.0
+            try:
+                backoff_max = float(os.getenv("BACKOFF_MAX_SECONDS", "300.0"))
+            except ValueError, TypeError:
+                backoff_max = 300.0
+
+            # Exponential backoff: backoff = min(backoff_max, backoff_min * (2 ** (retries - 1)))
+            backoff = min(backoff_max, backoff_min * (2.0 ** (retries - 1)))
+            jitter = random.uniform(0.5, 1.5)
+            sleep_duration = backoff + jitter
+
+            logger.warning(
+                "Transient Error (%s): sleeping %.2fs before retrying %s (retry=%d/%d): %s",
+                exc.__class__.__name__,
+                sleep_duration,
+                getattr(coro_fn, "__name__", coro_fn),
+                retries,
+                max_retries,
+                exc,
+            )
+            await asyncio.sleep(sleep_duration)
 
 
 async def iter_messages_with_flood_retry(client, entity, *, min_id=0, **kwargs):
@@ -200,15 +247,20 @@ async def iter_messages_with_flood_retry(client, entity, *, min_id=0, **kwargs):
                 )
                 raise
             wait_seconds = max(0, e.seconds)
+            # Randomized jitter buffer between 0.5 and 2.0 seconds
+            jitter = random.uniform(0.5, 2.0)
+            sleep_duration = wait_seconds + jitter
             if e.seconds >= log_threshold_seconds:
                 logger.warning(
-                    "FloodWait: sleeping %ss before resuming (last_msg_id=%s, retry=%d/%d)",
+                    "FloodWait: sleeping %.2fs (wait=%ss, jitter=%.2fs) before resuming (last_msg_id=%s, retry=%d/%d)",
+                    sleep_duration,
                     wait_seconds,
+                    jitter,
                     resume_from,
                     retries,
                     MAX_FLOOD_RETRIES,
                 )
-            await asyncio.sleep(wait_seconds + 1)  # +1s buffer to avoid boundary re-trigger
+            await asyncio.sleep(sleep_duration)
 
 
 class TelegramBackup:
