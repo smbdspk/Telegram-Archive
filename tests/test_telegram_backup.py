@@ -1927,5 +1927,129 @@ class TestBackupDialogCursorAdvancesOnSkippedMessages(unittest.TestCase):
         self.assertEqual(call_args[1], 100)
 
 
+class TestQueueBasedDecoupledBackupDialog(unittest.TestCase):
+    """Test the newly implemented Queue-based decoupled _backup_dialog."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+        self.config = MagicMock()
+        self.config.batch_size = 2
+        self.config.checkpoint_interval = 1
+        self.config.concurrency_limit = 2
+        self.config.preserve_order = False
+        self.config.skip_media_chat_ids = set()
+        self.config.skip_media_delete_existing = False
+        self.config.sync_deletions_edits = False
+        self.config.should_skip_topic = MagicMock(return_value=False)
+        self.config.media_path = os.path.join(self.temp_dir, "media")
+
+        self.db = AsyncMock()
+        self.db.get_last_message_id.return_value = 0
+
+        self.backup = TelegramBackup.__new__(TelegramBackup)
+        self.backup.config = self.config
+        self.backup.db = self.db
+        self.backup.client = MagicMock()
+        self.backup._cleaned_media_chats = set()
+        self.backup._get_marked_id = MagicMock(return_value=100)
+        self.backup._extract_chat_data = MagicMock(return_value={"id": 100})
+        self.backup._ensure_profile_photo = AsyncMock()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _run(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def _make_dialog(self):
+        dialog = MagicMock()
+        dialog.entity = MagicMock()
+        return dialog
+
+    def _make_message(self, msg_id):
+        msg = MagicMock()
+        msg.id = msg_id
+        msg.reply_to = None
+        return msg
+
+    def test_queue_based_backup_success(self):
+        """Producer fetches, workers process, committer commits all correctly."""
+        messages = [self._make_message(i) for i in [10, 20, 30, 40]]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        self.assertEqual(result, 4)
+        self.assertEqual(self.backup._process_message.await_count, 4)
+        # Check database calls
+        self.db.update_sync_status.assert_awaited()
+        # The final checkpoint should be the running max ID (40)
+        final_call = self.db.update_sync_status.call_args_list[-1]
+        self.assertEqual(final_call[0][1], 40)
+
+    def test_queue_based_backup_with_order_preserved(self):
+        """Under preserve_order=True, messages are committed in ID order."""
+        self.config.preserve_order = True
+        self.config.concurrency_limit = 2
+        messages = [self._make_message(i) for i in [1, 2, 3, 4]]
+
+        async def fake_iter(*args, **kwargs):
+            for m in messages:
+                yield m
+
+        # Simulate out-of-order worker execution by making workers sleep differently
+        async def slow_process(m, c):
+            if m.id == 1:
+                await asyncio.sleep(0.1)
+            return {"id": m.id, "chat_id": c}
+
+        committed_batches = []
+
+        async def fake_commit(batch, cid):
+            committed_batches.append([msg["id"] for msg in batch])
+
+        self.backup.client.iter_messages = fake_iter
+        self.backup._process_message = slow_process
+        self.backup._commit_batch = fake_commit
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        # Check committed batches. They should be strictly in ascending order: [1, 2], [3, 4]
+        flat_committed = [item for batch in committed_batches for item in batch]
+        self.assertEqual(flat_committed, [1, 2, 3, 4])
+
+    def test_producer_failure_bubbles_up(self):
+        """If producer loop fails, the exception is raised after queue is drained."""
+        messages = [self._make_message(i) for i in [10, 20]]
+
+        async def failing_iter(*args, **kwargs):
+            yield messages[0]
+            raise ValueError("Iter failed")
+
+        self.backup.client.iter_messages = failing_iter
+        self.backup._process_message = AsyncMock(side_effect=lambda m, c: {"id": m.id, "chat_id": c})
+        self.backup._commit_batch = AsyncMock()
+        self.backup._sync_pinned_messages = AsyncMock()
+
+        with self.assertRaises(ValueError) as context:
+            self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+
+        self.assertIn("Iter failed", str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

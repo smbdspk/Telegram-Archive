@@ -941,11 +941,13 @@ class TelegramBackup:
 
         # Limit for concurrent _process_message tasks per chat
         concurrency_limit = self.config.concurrency_limit
-        # Each entry is (message_id, task) so we can compute a safe checkpoint.
-        pending_tasks: list[tuple[int, asyncio.Task]] = []
-
-        # When True, messages are committed in Telegram ID order even under concurrency.
         preserve_order = self.config.preserve_order
+
+        # Queue tracking
+        message_queue = asyncio.Queue(maxsize=1000)
+        processed_queue = asyncio.Queue()
+        in_flight_ids = set()
+        yielded_ids = []
 
         def _safe_checkpoint_id() -> int:
             """Return the highest message ID that is safe to persist as a checkpoint.
@@ -955,11 +957,8 @@ class TelegramBackup:
             have not been committed to the DB yet.  A crash after an
             over-advanced checkpoint would permanently skip them on restart.
             """
-            if pending_tasks:
-                lowest_pending = min(msg_id for msg_id, _ in pending_tasks)
-                # We can only guarantee messages below the lowest pending
-                # task have been committed. Subtract 1 because min_id in
-                # iter_messages is exclusive.
+            if in_flight_ids:
+                lowest_pending = min(in_flight_ids)
                 return max(last_message_id, lowest_pending - 1)
             return committed_max_id
 
@@ -971,6 +970,7 @@ class TelegramBackup:
 
             batch_data.append(msg_data)
             committed_max_id = max(committed_max_id, msg_data["id"])
+            in_flight_ids.discard(msg_data["id"])
 
             if len(batch_data) >= batch_size:
                 await self._commit_batch(batch_data, chat_id)
@@ -988,75 +988,96 @@ class TelegramBackup:
 
                 batch_data = []
 
-        async def _drain_task(task_entry: tuple[int, asyncio.Task]) -> bool:
-            """Await a single task and commit its result. Returns True on success."""
-            _msg_id, task = task_entry
+        producer_failed = False
+        producer_exc = None
+
+        async def _producer_loop():
+            nonlocal running_max_id, producer_failed, producer_exc
             try:
-                msg_data = await task
-                await _append_and_commit(msg_data)
-                return True
-            except Exception as exc:
-                logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
-                return False
+                async for message in iter_messages_with_flood_retry(
+                    self.client, entity, min_id=last_message_id, reverse=True
+                ):
+                    running_max_id = max(running_max_id, message.id)
+
+                    # Skip messages belonging to excluded forum topics
+                    if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
+                        continue
+
+                    yielded_ids.append(message.id)
+                    in_flight_ids.add(message.id)
+                    await message_queue.put(message)
+            except Exception as e:
+                logger.error(f"Producer failed: {e}", exc_info=True)
+                producer_failed = True
+                producer_exc = e
+            finally:
+                # Put None sentinels for each worker to trigger graceful shutdown
+                for _ in range(concurrency_limit):
+                    await message_queue.put(None)
+
+        async def _worker_loop():
+            while True:
+                message = await message_queue.get()
+                if message is None:
+                    message_queue.task_done()
+                    break
+
+                try:
+                    msg_data = await self._process_message(message, chat_id)
+                    await processed_queue.put((message.id, msg_data))
+                except Exception as exc:
+                    logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
+                    # Signal failure to committer so it doesn't wait forever under preserve_order
+                    await processed_queue.put((message.id, None))
+                finally:
+                    message_queue.task_done()
+
+        # Start producer and worker tasks
+        producer_task = asyncio.create_task(_producer_loop())
+        worker_tasks = [asyncio.create_task(_worker_loop()) for _ in range(concurrency_limit)]
+
+        pending_order_buffer = {}
 
         try:
-            async for message in iter_messages_with_flood_retry(
-                self.client, entity, min_id=last_message_id, reverse=True
-            ):
-                running_max_id = max(running_max_id, message.id)
+            # Committer loop: runs while workers are active OR processed_queue contains items
+            while not (all(w.done() for w in worker_tasks) and processed_queue.empty()):
+                try:
+                    # Bounded wait allows periodic checks on worker statuses (especially in case of crashes)
+                    msg_id, msg_data = await asyncio.wait_for(processed_queue.get(), timeout=0.1)
 
-                # Skip messages belonging to excluded forum topics
-                if self.config.should_skip_topic(chat_id, extract_topic_id(message)):
+                    if preserve_order:
+                        pending_order_buffer[msg_id] = msg_data
+                        while yielded_ids and yielded_ids[0] in pending_order_buffer:
+                            next_id = yielded_ids.pop(0)
+                            next_data = pending_order_buffer.pop(next_id)
+                            if next_data is not None:
+                                await _append_and_commit(next_data)
+                            else:
+                                in_flight_ids.discard(next_id)
+                    else:
+                        if msg_data is not None:
+                            await _append_and_commit(msg_data)
+                        else:
+                            in_flight_ids.discard(msg_id)
+
+                    processed_queue.task_done()
+                except TimeoutError:
                     continue
 
-                if len(pending_tasks) >= concurrency_limit:
-                    if preserve_order:
-                        # STRICT ORDER: Wait for the oldest task
-                        await _drain_task(pending_tasks.pop(0))
-                    else:
-                        # FASTEST FIRST: Wait for ANY task that finishes first
-                        task_map = {t: (mid, t) for mid, t in pending_tasks}
-                        done, pending = await asyncio.wait(
-                            [t for _, t in pending_tasks],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        # Rebuild pending_tasks preserving (msg_id, task) pairing
-                        pending_tasks = [task_map[t] for t in pending]
-                        for completed_task in done:
-                            await _drain_task(task_map[completed_task])
-
-                # Create a background task for processing, allowing concurrent execution
-                task = asyncio.create_task(self._process_message(message, chat_id))
-                pending_tasks.append((message.id, task))
-
-            # Drain all remaining pending tasks
-            if pending_tasks:
-                if preserve_order:
-                    for task_entry in pending_tasks:
-                        await _drain_task(task_entry)
-                else:
-                    # Drain in completion order for fastest-first mode
-                    remaining = list(pending_tasks)
-                    while remaining:
-                        task_map = {t: (mid, t) for mid, t in remaining}
-                        done, pending = await asyncio.wait(
-                            [t for _, t in remaining],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        remaining = [task_map[t] for t in pending]
-                        for completed_task in done:
-                            await _drain_task(task_map[completed_task])
-                pending_tasks.clear()
+            # If producer task failed with an exception, bubble it up now
+            if producer_failed and producer_exc:
+                raise producer_exc
 
         finally:
-            # Cancel any in-flight tasks on unexpected exit (e.g. FloodWaitError propagation)
-            for _msg_id, task in pending_tasks:
-                task.cancel()
-            for _msg_id, task in pending_tasks:
-                try:
-                    await task
-                except asyncio.CancelledError, Exception:
-                    pass
+            # Clean up all in-flight tasks
+            if not producer_task.done():
+                producer_task.cancel()
+            for w in worker_tasks:
+                if not w.done():
+                    w.cancel()
+
+            # Await task shutdowns to clean up event loop properly
+            await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
 
         # Flush remaining messages
         if batch_data:
