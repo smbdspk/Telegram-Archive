@@ -122,7 +122,11 @@ class Config:
 
         # Max concurrent _process_message tasks per chat during backup.
         # Higher values speed up media-heavy chats but increase DB/API pressure.
-        self.concurrency_limit = max(1, int(os.getenv("CONCURRENCY_LIMIT", "4")))
+        try:
+            self.concurrency_limit = max(1, int(os.getenv("CONCURRENCY_LIMIT", "4")))
+        except ValueError, TypeError:
+            logger.warning("Invalid CONCURRENCY_LIMIT value, using default of 4")
+            self.concurrency_limit = 4
 
         # When True, messages are committed to the DB in Telegram ID order
         # even when processed concurrently. When False, fastest-first ordering
