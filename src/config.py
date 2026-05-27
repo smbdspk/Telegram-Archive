@@ -113,6 +113,8 @@ class Config:
         self.backup_path = os.path.abspath(os.getenv("BACKUP_PATH", "/data/backups"))
         self.download_media = os.getenv("DOWNLOAD_MEDIA", "true").lower() == "true"
         self.max_media_size_mb = int(os.getenv("MAX_MEDIA_SIZE_MB", "100"))
+        # Timeout for media downloads (seconds). 0 disables the timeout.
+        self.download_timeout_seconds = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "3600"))
 
         # Batch processing configuration
         self.batch_size = int(os.getenv("BATCH_SIZE", "100"))

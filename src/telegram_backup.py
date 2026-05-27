@@ -1057,6 +1057,12 @@ class TelegramBackup:
 
                     yielded_ids.append(message.id)
                     in_flight_ids.add(message.id)
+
+                    # Enforce backpressure to prevent unbounded memory growth in pending_order_buffer
+                    # Limits the number of uncommitted messages in flight (queued + processing + pending commit)
+                    while len(in_flight_ids) >= max(2000, concurrency_limit * 2):
+                        await asyncio.sleep(0.1)
+
                     await message_queue.put(message)
             except Exception as e:
                 logger.error(f"Producer failed: {e}", exc_info=True)
@@ -1077,10 +1083,15 @@ class TelegramBackup:
                 try:
                     msg_data = await self._process_message(message, chat_id)
                     await processed_queue.put((message.id, msg_data))
-                except Exception as exc:
-                    logger.error(f"  → Error processing message (skipped): {exc}", exc_info=True)
+                except BaseException as exc:
+                    logger.error(
+                        f"  → Error processing message (skipped): {exc}",
+                        exc_info=not isinstance(exc, asyncio.CancelledError),
+                    )
                     # Signal failure to committer so it doesn't wait forever under preserve_order
                     await processed_queue.put((message.id, None))
+                    if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                        raise
                 finally:
                     message_queue.task_done()
 
@@ -1880,7 +1891,14 @@ class TelegramBackup:
                 os.makedirs(shared_dir, exist_ok=True)
 
                 async def _download_fn(tmp_path):
-                    return await call_with_flood_retry(self.client.download_media, message, tmp_path)
+                    try:
+                        return await asyncio.wait_for(
+                            call_with_flood_retry(self.client.download_media, message, tmp_path),
+                            timeout=self.config.download_timeout_seconds if self.config.download_timeout_seconds > 0 else None
+                        )
+                    except TimeoutError:
+                        logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
+                        raise
 
                 shared_file_path, content_hash = await download_and_shard_media(
                     db=self.db,
@@ -1911,7 +1929,14 @@ class TelegramBackup:
                     tmp_file_path = f"{file_path}.{os.getpid()}.{task_id}.part"
                     if os.path.exists(tmp_file_path):
                         os.remove(tmp_file_path)
-                    actual_path = await call_with_flood_retry(self.client.download_media, message, tmp_file_path)
+                    try:
+                        actual_path = await asyncio.wait_for(
+                            call_with_flood_retry(self.client.download_media, message, tmp_file_path),
+                            timeout=self.config.download_timeout_seconds if self.config.download_timeout_seconds > 0 else None
+                        )
+                    except TimeoutError:
+                        logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
+                        raise
                     file_path = finalize_atomic_download(
                         actual_path if isinstance(actual_path, str) else None,
                         tmp_file_path,
