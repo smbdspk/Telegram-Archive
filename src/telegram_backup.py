@@ -18,6 +18,7 @@ from telethon.errors import (
     FloodWaitError,
     RPCError,
     UserBannedInChannelError,
+    FileReferenceExpiredError,
 )
 from telethon.tl.types import (
     Channel,
@@ -152,8 +153,9 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
             )
             await asyncio.sleep(sleep_duration)
         except (TimeoutError, ConnectionError, OSError, RPCError) as exc:
-            # If it is a FloodWaitError, raise it to let the prior except block catch it specifically
-            if isinstance(exc, FloodWaitError):
+            # If it is a FloodWaitError or FileReferenceExpiredError, raise it to let the prior except block
+            # or the calling scope catch it specifically without wasting retries.
+            if isinstance(exc, (FloodWaitError, FileReferenceExpiredError)):
                 raise exc
 
             retries += 1
@@ -1892,14 +1894,26 @@ class TelegramBackup:
                 os.makedirs(shared_dir, exist_ok=True)
 
                 async def _download_fn(tmp_path):
-                    try:
-                        return await asyncio.wait_for(
-                            call_with_flood_retry(self.client.download_media, message, tmp_path),
-                            timeout=self.config.download_timeout_seconds if self.config.download_timeout_seconds > 0 else None
-                        )
-                    except TimeoutError:
-                        logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
-                        raise
+                    nonlocal message
+                    timeout = getattr(self.config, "download_timeout_seconds", 3600)
+                    timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
+                    for _ in range(3):
+                        try:
+                            return await asyncio.wait_for(
+                                call_with_flood_retry(self.client.download_media, message, tmp_path),
+                                timeout=timeout_val
+                            )
+                        except FileReferenceExpiredError:
+                            logger.info(f"File reference expired for message {message.id}, refreshing...")
+                            fresh_messages = await call_with_flood_retry(self.client.get_messages, chat_id, ids=[message.id])
+                            if fresh_messages and fresh_messages[0]:
+                                message = fresh_messages[0]
+                                continue
+                            raise
+                        except TimeoutError:
+                            logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
+                            raise
+                    raise FileReferenceExpiredError(request=None)
 
                 shared_file_path, content_hash = await download_and_shard_media(
                     db=self.db,
@@ -1930,14 +1944,27 @@ class TelegramBackup:
                     tmp_file_path = f"{file_path}.{os.getpid()}.{task_id}.part"
                     if os.path.exists(tmp_file_path):
                         os.remove(tmp_file_path)
-                    try:
-                        actual_path = await asyncio.wait_for(
-                            call_with_flood_retry(self.client.download_media, message, tmp_file_path),
-                            timeout=self.config.download_timeout_seconds if self.config.download_timeout_seconds > 0 else None
-                        )
-                    except TimeoutError:
-                        logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
-                        raise
+                    timeout = getattr(self.config, "download_timeout_seconds", 3600)
+                    timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
+                    for _ in range(3):
+                        try:
+                            actual_path = await asyncio.wait_for(
+                                call_with_flood_retry(self.client.download_media, message, tmp_file_path),
+                                timeout=timeout_val
+                            )
+                            break
+                        except FileReferenceExpiredError:
+                            logger.info(f"File reference expired for message {message.id}, refreshing...")
+                            fresh_messages = await call_with_flood_retry(self.client.get_messages, chat_id, ids=[message.id])
+                            if fresh_messages and fresh_messages[0]:
+                                message = fresh_messages[0]
+                                continue
+                            raise
+                        except TimeoutError:
+                            logger.error(f"Download timed out after {self.config.download_timeout_seconds} seconds for message {message.id}")
+                            raise
+                    else:
+                        raise FileReferenceExpiredError(request=None)
                     file_path = finalize_atomic_download(
                         actual_path if isinstance(actual_path, str) else None,
                         tmp_file_path,
