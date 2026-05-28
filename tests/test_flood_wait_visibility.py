@@ -410,7 +410,8 @@ async def test_iter_with_flood_retry_clamps_negative_sleep(fake_db):
         async for _msg in telegram_backup.iter_messages_with_flood_retry(fake_client, "chat", min_id=0, reverse=True):
             pass
 
-    assert sleeps == [1], f"Expected sleep(0+1=1) for negative e.seconds, got {sleeps}"
+    # Backoff for retry 1: min(300, 2*2^0)=2; max(0, 2)=2 + jitter 1.0 = 3.0
+    assert sleeps == [3.0], f"Expected sleep(max(0,2)+1=3) for negative e.seconds, got {sleeps}"
 
 
 @pytest.mark.asyncio
@@ -531,7 +532,42 @@ async def test_call_with_flood_retry_clamps_negative_sleep(fake_db):
         result = await telegram_backup.call_with_flood_retry(negative_then_ok)
 
     assert result == "ok"
-    assert sleeps == [1], f"Expected sleep(0+1=1) for negative e.seconds, got {sleeps}"
+    # Backoff for retry 1: min(300, 2*2^0)=2; max(0, 2)=2 + jitter 1.0 = 3.0
+    assert sleeps == [3.0], f"Expected sleep(max(0,2)+1=3) for negative e.seconds, got {sleeps}"
+
+
+@pytest.mark.asyncio
+async def test_call_with_flood_retry_flood_wait_exponential_backoff(fake_db):
+    """FloodWaitError retries must escalate sleep via exponential backoff,
+    not just use the raw e.seconds from Telegram."""
+    from src import telegram_backup
+
+    calls = {"n": 0}
+    sleeps = []
+
+    async def always_small_flood():
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise FloodWaitError(request=None, capture=1)  # Telegram says "wait 1s"
+        return "success"
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    with (
+        patch.object(telegram_backup.asyncio, "sleep", record_sleep),
+        patch("src.telegram_backup.random.uniform", return_value=1.0),
+    ):
+        result = await telegram_backup.call_with_flood_retry(always_small_flood, max_retries=5)
+
+    assert result == "success"
+    assert calls["n"] == 5
+    # Expected: backoff = min(300, 2 * 2^(retry-1)), effective = max(e.seconds, backoff) + jitter
+    # retry 1: max(1, 2) + 1.0 = 3.0
+    # retry 2: max(1, 4) + 1.0 = 5.0
+    # retry 3: max(1, 8) + 1.0 = 9.0
+    # retry 4: max(1, 16) + 1.0 = 17.0
+    assert sleeps == [3.0, 5.0, 9.0, 17.0]
 
 
 @pytest.mark.asyncio

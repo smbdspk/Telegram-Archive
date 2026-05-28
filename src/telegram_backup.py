@@ -139,13 +139,17 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
                 )
                 raise
             wait_seconds = max(0, e.seconds)
-            # Randomized jitter buffer between 0.5 and 2.0 seconds
+            # Exponential backoff: use at least the Telegram-required wait,
+            # but escalate on repeated hits so we don't hammer the server.
+            backoff = min(300.0, 2.0 * (2.0 ** (retries - 1)))  # 2, 4, 8, 16, 32...
+            effective_wait = max(wait_seconds, backoff)
             jitter = random.uniform(0.5, 2.0)
-            sleep_duration = wait_seconds + jitter
+            sleep_duration = effective_wait + jitter
             logger.warning(
-                "FloodWait: sleeping %.2fs (wait=%ss, jitter=%.2fs) before retrying %s (retry=%d/%d)",
+                "FloodWait: sleeping %.2fs (wait=%ss, backoff=%.0fs, jitter=%.2fs) before retrying %s (retry=%d/%d)",
                 sleep_duration,
                 wait_seconds,
+                backoff,
                 jitter,
                 getattr(coro_fn, "__name__", coro_fn),
                 retries,
@@ -170,11 +174,11 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
 
             try:
                 backoff_min = float(os.getenv("BACKOFF_MIN_SECONDS", "2.0"))
-            except ValueError, TypeError:
+            except (ValueError, TypeError):
                 backoff_min = 2.0
             try:
                 backoff_max = float(os.getenv("BACKOFF_MAX_SECONDS", "300.0"))
-            except ValueError, TypeError:
+            except (ValueError, TypeError):
                 backoff_max = 300.0
 
             # Exponential backoff: backoff = min(backoff_max, backoff_min * (2 ** (retries - 1)))
@@ -220,7 +224,7 @@ async def iter_messages_with_flood_retry(client, entity, *, min_id=0, **kwargs):
         raise ValueError("iter_messages_with_flood_retry only supports reverse=True (ascending) iteration")
     try:
         log_threshold_seconds = int(os.getenv("FLOOD_WAIT_LOG_THRESHOLD", "10"))
-    except ValueError, TypeError:
+    except (ValueError, TypeError):
         log_threshold_seconds = 10
     resume_from = min_id
     retries = 0
@@ -250,14 +254,18 @@ async def iter_messages_with_flood_retry(client, entity, *, min_id=0, **kwargs):
                 )
                 raise
             wait_seconds = max(0, e.seconds)
-            # Randomized jitter buffer between 0.5 and 2.0 seconds
+            # Exponential backoff: use at least the Telegram-required wait,
+            # but escalate on repeated hits so we don't hammer the server.
+            backoff = min(300.0, 2.0 * (2.0 ** (retries - 1)))  # 2, 4, 8, 16, 32...
+            effective_wait = max(wait_seconds, backoff)
             jitter = random.uniform(0.5, 2.0)
-            sleep_duration = wait_seconds + jitter
-            if e.seconds >= log_threshold_seconds:
+            sleep_duration = effective_wait + jitter
+            if e.seconds >= log_threshold_seconds or retries > 1:
                 logger.warning(
-                    "FloodWait: sleeping %.2fs (wait=%ss, jitter=%.2fs) before resuming (last_msg_id=%s, retry=%d/%d)",
+                    "FloodWait: sleeping %.2fs (wait=%ss, backoff=%.0fs, jitter=%.2fs) before resuming (last_msg_id=%s, retry=%d/%d)",
                     sleep_duration,
                     wait_seconds,
+                    backoff,
                     jitter,
                     resume_from,
                     retries,
