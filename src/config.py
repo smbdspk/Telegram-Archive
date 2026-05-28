@@ -126,7 +126,7 @@ class Config:
         # Higher values speed up media-heavy chats but increase DB/API pressure.
         try:
             self.concurrency_limit = max(1, int(os.getenv("CONCURRENCY_LIMIT", "4")))
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             logger.warning("Invalid CONCURRENCY_LIMIT value, using default of 4")
             self.concurrency_limit = 4
 

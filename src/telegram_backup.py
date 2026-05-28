@@ -8,6 +8,7 @@ import base64
 import logging
 import os
 import random
+from collections import deque
 from datetime import UTC, datetime
 
 from telethon import TelegramClient
@@ -999,7 +1000,7 @@ class TelegramBackup:
         message_queue = asyncio.Queue(maxsize=1000)
         processed_queue = asyncio.Queue()
         in_flight_ids = set()
-        yielded_ids = []
+        yielded_ids = deque()
 
         def _safe_checkpoint_id() -> int:
             """Return the highest message ID that is safe to persist as a checkpoint.
@@ -1111,7 +1112,7 @@ class TelegramBackup:
                     if preserve_order:
                         pending_order_buffer[msg_id] = msg_data
                         while yielded_ids and yielded_ids[0] in pending_order_buffer:
-                            next_id = yielded_ids.pop(0)
+                            next_id = yielded_ids.popleft()
                             next_data = pending_order_buffer.pop(next_id)
                             if next_data is not None:
                                 await _append_and_commit(next_data)
@@ -1127,6 +1128,20 @@ class TelegramBackup:
                 except TimeoutError:
                     continue
 
+            # Flush remaining messages before raising any producer exceptions
+            if batch_data:
+                await self._commit_batch(batch_data, chat_id)
+                count = len(batch_data)
+                grand_total += count
+                uncheckpointed_count += count
+
+            # Final checkpoint: persist when there are un-checkpointed messages OR
+            # when the cursor advanced purely from skipped (topic-filtered) messages
+            # that were never counted in uncheckpointed_count.
+            # At this point all tasks are drained, so committed_max_id is safe to use.
+            if uncheckpointed_count > 0 or (grand_total == 0 and running_max_id > last_message_id):
+                await self.db.update_sync_status(chat_id, running_max_id, uncheckpointed_count)
+
             # If producer task failed with an exception, bubble it up now
             if producer_failed and producer_exc:
                 raise producer_exc
@@ -1141,20 +1156,6 @@ class TelegramBackup:
 
             # Await task shutdowns to clean up event loop properly
             await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
-
-        # Flush remaining messages
-        if batch_data:
-            await self._commit_batch(batch_data, chat_id)
-            count = len(batch_data)
-            grand_total += count
-            uncheckpointed_count += count
-
-        # Final checkpoint: persist when there are un-checkpointed messages OR
-        # when the cursor advanced purely from skipped (topic-filtered) messages
-        # that were never counted in uncheckpointed_count.
-        # At this point all tasks are drained, so committed_max_id is safe to use.
-        if uncheckpointed_count > 0 or (grand_total == 0 and running_max_id > last_message_id):
-            await self.db.update_sync_status(chat_id, running_max_id, uncheckpointed_count)
 
         # Sync deletions and edits if enabled (expensive!)
         if self.config.sync_deletions_edits:
