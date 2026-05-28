@@ -56,13 +56,9 @@ async def test_connection_call_with_flood_retry_respects_env():
     async def record_sleep(seconds):
         sleeps.append(seconds)
 
-    env = {
-        "BACKOFF_MIN_SECONDS": "15.0",
-        "BACKOFF_MAX_SECONDS": "45.0",
-    }
-
     with (
-        patch.dict(os.environ, env),
+        patch.object(connection, "BACKOFF_MIN_SECONDS", 15.0),
+        patch.object(connection, "BACKOFF_MAX_SECONDS", 45.0),
         patch.object(connection.asyncio, "sleep", record_sleep),
         patch("src.connection.random.uniform", return_value=1.0),
     ):

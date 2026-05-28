@@ -37,8 +37,21 @@ def _get_int_env(name: str, default: int) -> int:
         return default
 
 
+def _get_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default=%.1f", name, raw, default)
+        return default
+
+
 MAX_FLOOD_RETRIES = _get_int_env("MAX_FLOOD_RETRIES", 5)
 MAX_FLOOD_WAIT_SECONDS = _get_int_env("MAX_FLOOD_WAIT_SECONDS", 3600)
+BACKOFF_MIN_SECONDS = _get_float_env("BACKOFF_MIN_SECONDS", 2.0)
+BACKOFF_MAX_SECONDS = _get_float_env("BACKOFF_MAX_SECONDS", 300.0)
 
 
 async def _call_with_flood_retry(coro_fn, *args, **kwargs):
@@ -63,17 +76,9 @@ async def _call_with_flood_retry(coro_fn, *args, **kwargs):
                 )
                 raise
             wait_seconds = max(0, e.seconds)
-            try:
-                backoff_min = float(os.getenv("BACKOFF_MIN_SECONDS", "2.0"))
-            except ValueError, TypeError:
-                backoff_min = 2.0
-            try:
-                backoff_max = float(os.getenv("BACKOFF_MAX_SECONDS", "300.0"))
-            except ValueError, TypeError:
-                backoff_max = 300.0
             # Exponential backoff: use at least the Telegram-required wait,
             # but escalate on repeated hits so we don't hammer the server.
-            backoff = min(backoff_max, backoff_min * (2.0 ** (retries - 1)))
+            backoff = min(BACKOFF_MAX_SECONDS, BACKOFF_MIN_SECONDS * (2.0 ** (retries - 1)))
             effective_wait = max(wait_seconds, backoff)
             jitter = random.uniform(0.5, 2.0)
             sleep_duration = effective_wait + jitter

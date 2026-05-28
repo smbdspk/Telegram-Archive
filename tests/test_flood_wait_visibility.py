@@ -587,13 +587,9 @@ async def test_call_with_flood_retry_flood_wait_exponential_backoff_respects_env
     async def record_sleep(seconds):
         sleeps.append(seconds)
 
-    env = {
-        "BACKOFF_MIN_SECONDS": "10.0",
-        "BACKOFF_MAX_SECONDS": "25.0",
-    }
-
     with (
-        patch.dict(os.environ, env),
+        patch.object(telegram_backup, "BACKOFF_MIN_SECONDS", 10.0),
+        patch.object(telegram_backup, "BACKOFF_MAX_SECONDS", 25.0),
         patch.object(telegram_backup.asyncio, "sleep", record_sleep),
         patch("src.telegram_backup.random.uniform", return_value=1.0),
     ):
@@ -626,13 +622,9 @@ async def test_call_with_flood_retry_transient_error_backoff(fake_db):
     async def record_sleep(seconds):
         sleeps.append(seconds)
 
-    env = {
-        "BACKOFF_MIN_SECONDS": "2.0",
-        "BACKOFF_MAX_SECONDS": "300.0",
-    }
-
     with (
-        patch.dict(os.environ, env),
+        patch.object(telegram_backup, "BACKOFF_MIN_SECONDS", 2.0),
+        patch.object(telegram_backup, "BACKOFF_MAX_SECONDS", 300.0),
         patch.object(telegram_backup.asyncio, "sleep", record_sleep),
         patch("src.telegram_backup.random.uniform", return_value=1.0),
     ):
@@ -664,13 +656,9 @@ async def test_call_with_flood_retry_transient_error_respects_max_cap(fake_db):
     async def record_sleep(seconds):
         sleeps.append(seconds)
 
-    env = {
-        "BACKOFF_MIN_SECONDS": "200.0",
-        "BACKOFF_MAX_SECONDS": "250.0",
-    }
-
     with (
-        patch.dict(os.environ, env),
+        patch.object(telegram_backup, "BACKOFF_MIN_SECONDS", 200.0),
+        patch.object(telegram_backup, "BACKOFF_MAX_SECONDS", 250.0),
         patch.object(telegram_backup.asyncio, "sleep", record_sleep),
         patch("src.telegram_backup.random.uniform", return_value=1.0),
     ):
