@@ -571,6 +571,45 @@ async def test_call_with_flood_retry_flood_wait_exponential_backoff(fake_db):
 
 
 @pytest.mark.asyncio
+async def test_call_with_flood_retry_flood_wait_exponential_backoff_respects_env(fake_db):
+    """FloodWaitError retries must respect BACKOFF_MIN_SECONDS and BACKOFF_MAX_SECONDS env vars."""
+    from src import telegram_backup
+
+    calls = {"n": 0}
+    sleeps = []
+
+    async def always_small_flood():
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise FloodWaitError(request=None, capture=1)  # Telegram says "wait 1s"
+        return "success"
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    env = {
+        "BACKOFF_MIN_SECONDS": "10.0",
+        "BACKOFF_MAX_SECONDS": "25.0",
+    }
+
+    with (
+        patch.dict(os.environ, env),
+        patch.object(telegram_backup.asyncio, "sleep", record_sleep),
+        patch("src.telegram_backup.random.uniform", return_value=1.0),
+    ):
+        result = await telegram_backup.call_with_flood_retry(always_small_flood, max_retries=5)
+
+    assert result == "success"
+    assert calls["n"] == 5
+    # Expected: backoff = min(25.0, 10.0 * 2^(retry-1)), effective = max(e.seconds, backoff) + jitter
+    # retry 1: max(1, 10.0) + 1.0 = 11.0
+    # retry 2: max(1, 20.0) + 1.0 = 21.0
+    # retry 3: max(1, 25.0) + 1.0 = 26.0
+    # retry 4: max(1, 25.0) + 1.0 = 26.0
+    assert sleeps == [11.0, 21.0, 26.0, 26.0]
+
+
+@pytest.mark.asyncio
 async def test_call_with_flood_retry_transient_error_backoff(fake_db):
     """Verify call_with_flood_retry retries transient errors with exponential backoff."""
     from src import telegram_backup

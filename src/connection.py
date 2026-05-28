@@ -63,9 +63,17 @@ async def _call_with_flood_retry(coro_fn, *args, **kwargs):
                 )
                 raise
             wait_seconds = max(0, e.seconds)
+            try:
+                backoff_min = float(os.getenv("BACKOFF_MIN_SECONDS", "2.0"))
+            except ValueError, TypeError:
+                backoff_min = 2.0
+            try:
+                backoff_max = float(os.getenv("BACKOFF_MAX_SECONDS", "300.0"))
+            except ValueError, TypeError:
+                backoff_max = 300.0
             # Exponential backoff: use at least the Telegram-required wait,
             # but escalate on repeated hits so we don't hammer the server.
-            backoff = min(300.0, 2.0 * (2.0 ** (retries - 1)))  # 2, 4, 8, 16, 32...
+            backoff = min(backoff_max, backoff_min * (2.0 ** (retries - 1)))
             effective_wait = max(wait_seconds, backoff)
             jitter = random.uniform(0.5, 2.0)
             sleep_duration = effective_wait + jitter
