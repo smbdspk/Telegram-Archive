@@ -1095,15 +1095,14 @@ class TelegramBackup:
                 try:
                     msg_data = await self._process_message(message, chat_id)
                     await processed_queue.put((message.id, msg_data))
+                except asyncio.CancelledError, KeyboardInterrupt:
+                    raise
                 except BaseException as exc:
                     logger.error(
-                        f"  → Error processing message (skipped): {exc}",
-                        exc_info=not isinstance(exc, asyncio.CancelledError),
+                        f"  → Error processing message: {exc}",
+                        exc_info=True,
                     )
-                    # Signal failure to committer so it doesn't wait forever under preserve_order
-                    await processed_queue.put((message.id, None))
-                    if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
-                        raise
+                    raise
                 finally:
                     message_queue.task_done()
 
@@ -1116,6 +1115,13 @@ class TelegramBackup:
         try:
             # Committer loop: runs while workers are active OR processed_queue contains items
             while not (all(w.done() for w in worker_tasks) and processed_queue.empty()):
+                # Check for crashed workers
+                for w in worker_tasks:
+                    if w.done() and not w.cancelled():
+                        exc = w.exception()
+                        if exc is not None:
+                            raise exc
+
                 try:
                     # Bounded wait allows periodic checks on worker statuses (especially in case of crashes)
                     msg_id, msg_data = await asyncio.wait_for(processed_queue.get(), timeout=0.1)

@@ -579,7 +579,7 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         self.assertEqual(self.backup._process_message.await_count, 6)
 
     def test_concurrent_error_skips_failed_message(self):
-        """When a task raises, the error is logged and processing continues."""
+        """When a task raises, the error is propagated and raises RuntimeError."""
         messages = [self._make_message(i) for i in range(1, 5)]
 
         async def fake_iter(*args, **kwargs):
@@ -600,15 +600,14 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         self.backup._commit_batch = AsyncMock()
         self.backup._sync_pinned_messages = AsyncMock()
 
-        # Should NOT raise — error is caught and message skipped
-        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+        # Should raise RuntimeError
+        with self.assertRaises(RuntimeError) as context:
+            self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
-        # 3 messages committed (IDs 1, 3, 4), 1 skipped (ID 2)
-        self.assertEqual(result, 3)
-        self.assertEqual(call_count, 4)
+        self.assertIn("simulated download error", str(context.exception))
 
     def test_concurrent_error_in_fastest_first_mode(self):
-        """Error handling also works in preserve_order=False mode."""
+        """Error handling also works in preserve_order=False mode by propagating the error."""
         self.config.preserve_order = False
         messages = [self._make_message(i) for i in range(1, 5)]
 
@@ -626,10 +625,11 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         self.backup._commit_batch = AsyncMock()
         self.backup._sync_pinned_messages = AsyncMock()
 
-        result = self._run(self.backup._backup_dialog(self._make_dialog(), 100))
+        # Should raise RuntimeError
+        with self.assertRaises(RuntimeError) as context:
+            self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
-        # 3 messages committed, 1 failed
-        self.assertEqual(result, 3)
+        self.assertIn("simulated error", str(context.exception))
 
     def test_safe_checkpoint_never_exceeds_committed(self):
         """With safe watermarking, checkpoints never exceed max committed ID.
