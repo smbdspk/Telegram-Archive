@@ -1063,7 +1063,7 @@ class DatabaseAdapter:
 
         Returns:
             List of dicts with chat_id, cursor (sync_status.last_message_id),
-            actual_max (MAX(messages.id)), and trailing_gap size.
+            actual_max (COALESCE(MAX(messages.id), 0)), and trailing_gap size.
         """
         async with self.db_manager.async_session_factory() as session:
             result = await session.execute(
@@ -1071,12 +1071,12 @@ class DatabaseAdapter:
                     """
                     SELECT ss.chat_id,
                            ss.last_message_id AS cursor,
-                           MAX(m.id) AS actual_max,
-                           ss.last_message_id - MAX(m.id) AS trailing_gap
+                           COALESCE(MAX(m.id), 0) AS actual_max,
+                           ss.last_message_id - COALESCE(MAX(m.id), 0) AS trailing_gap
                     FROM sync_status ss
-                    JOIN messages m ON m.chat_id = ss.chat_id
+                    LEFT JOIN messages m ON m.chat_id = ss.chat_id
                     GROUP BY ss.chat_id
-                    HAVING ss.last_message_id > MAX(m.id)
+                    HAVING ss.last_message_id > COALESCE(MAX(m.id), 0)
                     """
                 )
             )

@@ -1121,6 +1121,57 @@ class TestSyncStatusOperations:
 
 
 # ============================================================
+# Trailing gap recovery operations
+# ============================================================
+
+
+class TestTrailingGapRecovery:
+    """Test detect_trailing_gaps and reset_sync_cursor."""
+
+    @pytest.mark.asyncio
+    async def test_detect_trailing_gaps_returns_list_of_dicts(self):
+        """detect_trailing_gaps executes SQL query and returns mapped list."""
+        db_manager, mock_session = _make_mock_db_manager()
+        adapter = DatabaseAdapter(db_manager)
+
+        mock_row1 = (100, 500, 450, 50)
+        mock_row2 = (200, 1000, 0, 1000)
+
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = [mock_row1, mock_row2]
+        mock_session.execute.return_value = mock_result
+
+        result = await adapter.detect_trailing_gaps()
+
+        assert result == [
+            {
+                "chat_id": 100,
+                "cursor": 500,
+                "actual_max": 450,
+                "trailing_gap": 50,
+            },
+            {
+                "chat_id": 200,
+                "cursor": 1000,
+                "actual_max": 0,
+                "trailing_gap": 1000,
+            },
+        ]
+        mock_session.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reset_sync_cursor_executes_update_and_commits(self):
+        """reset_sync_cursor issues an update statement and commits."""
+        db_manager, mock_session = _make_mock_db_manager()
+        adapter = DatabaseAdapter(db_manager)
+
+        await adapter.reset_sync_cursor(100, 450)
+
+        mock_session.execute.assert_awaited_once()
+        mock_session.commit.assert_awaited_once()
+
+
+# ============================================================
 # Delete chat operations
 # ============================================================
 
