@@ -1115,12 +1115,15 @@ class TelegramBackup:
         try:
             # Committer loop: runs while workers are active OR processed_queue contains items
             while not (all(w.done() for w in worker_tasks) and processed_queue.empty()):
-                # Check for crashed workers
+                # Check for crashed workers to stop the producer early
                 for w in worker_tasks:
                     if w.done() and not w.cancelled():
-                        exc = w.exception()
-                        if exc is not None:
-                            raise exc
+                        try:
+                            exc = w.exception()
+                            if exc is not None and not producer_task.done():
+                                producer_task.cancel()
+                        except asyncio.CancelledError:
+                            pass
 
                 try:
                     # Bounded wait allows periodic checks on worker statuses (especially in case of crashes)
@@ -1145,6 +1148,13 @@ class TelegramBackup:
                 except TimeoutError:
                     continue
 
+            # Flush any remaining items in the pending order buffer (e.g. if a task failed and blocked ordering)
+            if preserve_order and pending_order_buffer:
+                for msg_id in sorted(pending_order_buffer.keys()):
+                    msg_data = pending_order_buffer.pop(msg_id)
+                    if msg_data is not None:
+                        await _append_and_commit(msg_data)
+
             # Flush remaining messages before raising any producer exceptions
             if batch_data:
                 await self._commit_batch(batch_data, chat_id)
@@ -1158,6 +1168,13 @@ class TelegramBackup:
             # At this point all tasks are drained, so committed_max_id is safe to use.
             if uncheckpointed_count > 0 or (grand_total == 0 and running_max_id > last_message_id):
                 await self.db.update_sync_status(chat_id, running_max_id, uncheckpointed_count)
+
+            # Check for crashed workers and raise the first exception found
+            for w in worker_tasks:
+                if w.done() and not w.cancelled():
+                    exc = w.exception()
+                    if exc is not None:
+                        raise exc
 
             # If producer task failed with an exception, bubble it up now
             if producer_failed and producer_exc:

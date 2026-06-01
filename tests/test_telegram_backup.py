@@ -579,7 +579,7 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         self.assertEqual(self.backup._process_message.await_count, 6)
 
     def test_concurrent_error_skips_failed_message(self):
-        """When a task raises, the error is propagated and raises RuntimeError."""
+        """When a task raises, the error is propagated and raises RuntimeError after draining work."""
         messages = [self._make_message(i) for i in range(1, 5)]
 
         async def fake_iter(*args, **kwargs):
@@ -606,8 +606,16 @@ class TestConcurrentBackupDialog(unittest.TestCase):
 
         self.assertIn("simulated download error", str(context.exception))
 
+        # Assert side effects for drained work
+        self.assertEqual(call_count, 4)
+        committed_ids = []
+        for call in self.backup._commit_batch.call_args_list:
+            batch = call[0][0]
+            committed_ids.extend([msg["id"] for msg in batch])
+        self.assertEqual(committed_ids, [1, 3, 4])
+
     def test_concurrent_error_in_fastest_first_mode(self):
-        """Error handling also works in preserve_order=False mode by propagating the error."""
+        """Error handling also works in preserve_order=False mode by propagating the error after draining."""
         self.config.preserve_order = False
         messages = [self._make_message(i) for i in range(1, 5)]
 
@@ -615,7 +623,11 @@ class TestConcurrentBackupDialog(unittest.TestCase):
             for m in messages:
                 yield m
 
+        call_count = 0
+
         async def process_with_error(m, c):
+            nonlocal call_count
+            call_count += 1
             if m.id == 3:
                 raise RuntimeError("simulated error")
             return {"id": m.id, "chat_id": c}
@@ -630,6 +642,14 @@ class TestConcurrentBackupDialog(unittest.TestCase):
             self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
         self.assertIn("simulated error", str(context.exception))
+
+        # Assert side effects for drained work
+        self.assertEqual(call_count, 4)
+        committed_ids = []
+        for call in self.backup._commit_batch.call_args_list:
+            batch = call[0][0]
+            committed_ids.extend([msg["id"] for msg in batch])
+        self.assertEqual(sorted(committed_ids), [1, 2, 4])
 
     def test_safe_checkpoint_never_exceeds_committed(self):
         """With safe watermarking, checkpoints never exceed max committed ID.
