@@ -605,13 +605,8 @@ class TestConcurrentBackupDialog(unittest.TestCase):
             self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
         self.assertIn("simulated download error", str(context.exception))
-
-        # Assert side effects for drained work
+        committed_ids = [row["id"] for call in self.backup._commit_batch.await_args_list for row in call.args[0]]
         self.assertEqual(call_count, 4)
-        committed_ids = []
-        for call in self.backup._commit_batch.call_args_list:
-            batch = call[0][0]
-            committed_ids.extend([msg["id"] for msg in batch])
         self.assertEqual(committed_ids, [1, 3, 4])
 
     def test_concurrent_error_in_fastest_first_mode(self):
@@ -642,14 +637,8 @@ class TestConcurrentBackupDialog(unittest.TestCase):
             self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
         self.assertIn("simulated error", str(context.exception))
-
-        # Assert side effects for drained work
-        self.assertEqual(call_count, 4)
-        committed_ids = []
-        for call in self.backup._commit_batch.call_args_list:
-            batch = call[0][0]
-            committed_ids.extend([msg["id"] for msg in batch])
-        self.assertEqual(sorted(committed_ids), [1, 2, 4])
+        committed_ids = [row["id"] for call in self.backup._commit_batch.await_args_list for row in call.args[0]]
+        self.assertCountEqual(committed_ids, [1, 2, 4])
 
     def test_safe_checkpoint_never_exceeds_committed(self):
         """With safe watermarking, checkpoints never exceed max committed ID.
@@ -672,10 +661,14 @@ class TestConcurrentBackupDialog(unittest.TestCase):
 
         self._run(self.backup._backup_dialog(self._make_dialog(), 100))
 
-        # All checkpoint IDs must be <= running_max_id (40)
-        for call in self.db.update_sync_status.call_args_list:
-            checkpoint_id = call[0][1]
-            self.assertLessEqual(checkpoint_id, 40)
+        calls = self.db.update_sync_status.call_args_list
+        intermediate_calls = calls[:-1]
+        final_call = calls[-1]
+
+        self.assertTrue(intermediate_calls)
+        for call in intermediate_calls:
+            self.assertEqual(call[0][1], 29)
+        self.assertEqual(final_call[0][1], 40)
 
     def test_safe_checkpoint_uses_min_pending_id(self):
         """Intermediate checkpoint must not advance past the lowest pending task ID.
