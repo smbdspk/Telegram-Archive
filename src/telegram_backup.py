@@ -1337,7 +1337,7 @@ class TelegramBackup:
             "total_recovered": 0,
             "errors": 0,
             "trailing_gaps_fixed": trailing_summary["chats_fixed"],
-            "trailing_gap_ids": trailing_summary["total_trailing_gap"],
+            "trailing_gap_ids": [gap["chat_id"] for gap in trailing_summary.get("details", [])],
             "details": [],
         }
 

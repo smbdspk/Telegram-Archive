@@ -1180,7 +1180,7 @@ class TestRecoverTrailingGaps(unittest.TestCase):
         summary = _run(self.backup._fill_gaps(chat_id=100))
 
         self.assertEqual(summary["trailing_gaps_fixed"], 1)
-        self.assertEqual(summary["trailing_gap_ids"], 50)
+        self.assertEqual(summary["trailing_gap_ids"], [100])
 
     def test_recover_trailing_gaps_with_chat_id_filters(self):
         """When chat_id is provided, only that chat's cursor is reset."""
@@ -1507,7 +1507,10 @@ class TestEnsureProfilePhoto(unittest.TestCase):
         """
         target = os.path.join(self.temp_dir, "absent_target.jpg")
         avatar_path = os.path.join(self.temp_dir, "broken_symlink_avatar.jpg")
-        os.symlink(target, avatar_path)
+        try:
+            os.symlink(target, avatar_path)
+        except OSError as e:
+            self.skipTest(f"Symlinks not supported/permitted: {e}")
         original_target = os.readlink(avatar_path)
 
         # Confirm the dangling symlink scenario.
