@@ -709,10 +709,17 @@ class TestConcurrentBackupDialog(unittest.TestCase):
         # The final checkpoint uses running_max_id=40.
         # Intermediate checkpoints should be clamped by pending task IDs.
         calls = self.db.update_sync_status.call_args_list
-        for call in calls:
+        # Every intermediate (non-final) checkpoint is clamped by pending task IDs (30, 40),
+        # so checkpoint_id == 29 (min(pending) - 1). Note that the docstring scenario assumes
+        # out-of-order execution where message 20 remains pending (yielding 19), but since all
+        # mock messages are processed instantly, messages 10 and 20 are committed first, leaving
+        # 30 and 40 pending at the time of the intermediate checkpoint.
+        for call in calls[:-1]:
             checkpoint_id = call[0][1]
-            # No checkpoint should exceed the max message ID
-            self.assertLessEqual(checkpoint_id, 40)
+            self.assertEqual(checkpoint_id, 29)
+
+        # The final checkpoint (last call) uses running_max_id=40.
+        self.assertEqual(calls[-1][0][1], 40)
 
     def test_concurrency_limit_one_degenerates_to_sequential(self):
         """concurrency_limit=1 should behave identically to pre-concurrency logic."""
