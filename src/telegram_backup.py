@@ -1247,7 +1247,7 @@ class TelegramBackup:
 
         return recovered
 
-    async def _recover_trailing_gaps(self) -> dict:
+    async def _recover_trailing_gaps(self, chat_id: int | None = None) -> dict:
         """Detect and fix sync cursors that advanced past committed messages.
 
         When concurrent backups checkpoint a message ID before all in-flight
@@ -1257,6 +1257,9 @@ class TelegramBackup:
 
         This method detects those chats and resets their cursors so the next
         regular backup re-fetches the missing messages.
+
+        Args:
+            chat_id: If provided, filter recovery to only this chat.
 
         Returns:
             Summary dict with recovery statistics.
@@ -1269,7 +1272,10 @@ class TelegramBackup:
             logger.error(f"Trailing-gap recovery: failed to query: {e}")
             return summary
 
-        if not trailing_gaps:
+        if chat_id is not None and isinstance(trailing_gaps, list):
+            trailing_gaps = [gap for gap in trailing_gaps if gap["chat_id"] == chat_id]
+
+        if not trailing_gaps or len(trailing_gaps) == 0:
             logger.info("Trailing-gap recovery: no over-advanced cursors found")
             return summary
 
@@ -1284,6 +1290,8 @@ class TelegramBackup:
 
         for gap in trailing_gaps:
             cid = gap["chat_id"]
+            if chat_id is not None and cid != chat_id:
+                continue
             cursor = gap["cursor"]
             actual_max = gap["actual_max"]
             trailing = gap["trailing_gap"]
@@ -1319,7 +1327,7 @@ class TelegramBackup:
             Summary dict with gap-fill statistics.
         """
         # Phase 0: Recover trailing gaps (cursor over-advancement)
-        trailing_summary = await self._recover_trailing_gaps()
+        trailing_summary = await self._recover_trailing_gaps(chat_id=chat_id)
 
         threshold = self.config.gap_threshold
         summary = {

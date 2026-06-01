@@ -1182,6 +1182,35 @@ class TestRecoverTrailingGaps(unittest.TestCase):
         self.assertEqual(summary["trailing_gaps_fixed"], 1)
         self.assertEqual(summary["trailing_gap_ids"], 50)
 
+    def test_recover_trailing_gaps_with_chat_id_filters(self):
+        """When chat_id is provided, only that chat's cursor is reset."""
+        self.backup.db.detect_trailing_gaps = AsyncMock(
+            return_value=[
+                {"chat_id": 100, "cursor": 500, "actual_max": 450, "trailing_gap": 50},
+                {"chat_id": 200, "cursor": 1000, "actual_max": 980, "trailing_gap": 20},
+            ]
+        )
+        self.backup.db.reset_sync_cursor = AsyncMock()
+
+        summary = _run(self.backup._recover_trailing_gaps(chat_id=100))
+
+        self.assertEqual(summary["chats_fixed"], 1)
+        self.assertEqual(summary["total_trailing_gap"], 50)
+        self.backup.db.reset_sync_cursor.assert_awaited_once_with(100, 450)
+
+    def test_fill_gaps_passes_chat_id_to_trailing_recovery(self):
+        """_fill_gaps passes chat_id filter to _recover_trailing_gaps."""
+        self.backup._recover_trailing_gaps = AsyncMock(
+            return_value={"chats_fixed": 1, "total_trailing_gap": 50, "details": []}
+        )
+        self.backup.db.detect_message_gaps = AsyncMock(return_value=[])
+        self.backup.client.get_entity = AsyncMock(return_value=MagicMock())
+        self.backup._get_chat_name = MagicMock(return_value="TestChat")
+
+        summary = _run(self.backup._fill_gaps(chat_id=100))
+
+        self.backup._recover_trailing_gaps.assert_awaited_once_with(chat_id=100)
+
 
 # ===========================================================================
 # _backup_forum_topics fallback / emoji paths (lines 1650-1661, 1692-1693,
