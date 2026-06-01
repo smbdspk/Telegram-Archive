@@ -1273,8 +1273,13 @@ class TelegramBackup:
             logger.info("Trailing-gap recovery: no over-advanced cursors found")
             return summary
 
+        total_chats = len(trailing_gaps)
+        total_gap = sum(gap["trailing_gap"] for gap in trailing_gaps)
+        max_gap = max(gap["trailing_gap"] for gap in trailing_gaps)
+
         logger.warning(
-            f"Trailing-gap recovery: found {len(trailing_gaps)} chat(s) with sync cursor ahead of committed data"
+            f"Trailing-gap recovery: found {total_chats} chat(s) with sync cursor ahead of committed data "
+            f"(total trailing gap of {total_gap} messages, max gap is {max_gap})"
         )
 
         for gap in trailing_gaps:
@@ -1283,8 +1288,8 @@ class TelegramBackup:
             actual_max = gap["actual_max"]
             trailing = gap["trailing_gap"]
 
-            logger.warning(
-                f"  → Resetting cursor: cursor={cursor} → {actual_max} (trailing gap of {trailing} message IDs)"
+            logger.debug(
+                f"Resetting sync cursor: chat_id=[REDACTED] cursor={cursor} → {actual_max} (trailing gap of {trailing})"
             )
 
             try:
@@ -1293,7 +1298,7 @@ class TelegramBackup:
                 summary["total_trailing_gap"] += trailing
                 summary["details"].append(gap)
             except Exception as e:
-                logger.error(f"  → Failed to reset cursor for chat {cid}: {e}")
+                logger.debug(f"Failed to reset cursor for chat_id=[REDACTED]: {e}")
 
         return summary
 
