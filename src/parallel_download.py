@@ -145,6 +145,7 @@ class ParallelDownloader:
         # metadata. A ceiling caps how many chunks (and how large a
         # pre-allocation) one transfer can request before we fall back.
         self._max_file_size = int(max_file_size) if max_file_size and max_file_size > 0 else None
+        self._completed_offsets: dict[str, set[int]] = {}
 
     async def download_media(self, message, file) -> str:
         """Download ``message``'s media to path ``file`` and return ``file``.
@@ -176,24 +177,41 @@ class ParallelDownloader:
         return file
 
     async def _download_location(self, location, dc_id, file_size: int, dest_path: str) -> None:
+        completed = self._completed_offsets.setdefault(dest_path, set())
+
+        # Reset tracking if the file does not exist on disk
+        if not os.path.exists(dest_path):
+            completed.clear()
+
         offsets = list(range(0, file_size, self._part_size))
+
+        # Populate initial written list with already completed offsets
+        written: list[tuple[int, int]] = []
+        for off in completed:
+            chunk_len = min(self._part_size, file_size - off)
+            written.append((off, chunk_len))
+
+        # Only queue offsets that have not been completed yet
         queue: asyncio.Queue[int] = asyncio.Queue()
-        for off in offsets:
+        pending_offsets = [off for off in offsets if off not in completed]
+        for off in pending_offsets:
             queue.put_nowait(off)
 
-        written: list[tuple[int, int]] = []
         senders: list[MTProtoSender] = []
         # O_NOFOLLOW (where available) refuses to follow a pre-planted symlink at
         # dest_path, so a shared/world-writable media dir can't redirect our write.
-        open_flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        # Include O_BINARY on Windows to prevent translation of \n to \r\n.
+        # Omit O_TRUNC to allow resuming.
+        open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(dest_path, open_flags, 0o644)
         try:
             os.ftruncate(fd, file_size)
-            n = min(self._connections, len(offsets)) or 1
+            n = min(self._connections, len(pending_offsets)) or 1
             senders = await self._build_senders(dc_id, n)
 
             workers = [
-                asyncio.create_task(self._worker(sender, location, file_size, queue, fd, written)) for sender in senders
+                asyncio.create_task(self._worker(sender, location, file_size, queue, fd, written, completed))
+                for sender in senders
             ]
             try:
                 await asyncio.gather(*workers)
@@ -207,6 +225,8 @@ class ParallelDownloader:
 
             _verify_coverage(written, file_size)
             os.fsync(fd)
+            # Success! Clear completed tracking for this path.
+            self._completed_offsets.pop(dest_path, None)
         except BaseException:
             try:
                 os.close(fd)
@@ -214,17 +234,15 @@ class ParallelDownloader:
                 # Closing the fd must never mask the original chunk failure.
                 pass
             fd = -1
-            try:
-                os.remove(dest_path)
-            except OSError:
-                pass
+            # DO NOT delete the file on exceptions here, so we can resume it.
+            # The outer backup layer is responsible for cleanup if the download fully fails.
             raise
         finally:
             if fd != -1:
                 os.close(fd)
             await self._close_senders(senders)
 
-    async def _worker(self, sender, location, file_size, queue, fd, written) -> None:
+    async def _worker(self, sender, location, file_size, queue, fd, written, completed) -> None:
         while True:
             try:
                 offset = queue.get_nowait()
@@ -258,6 +276,7 @@ class ParallelDownloader:
                 )
             _pwrite_all(fd, data, offset)
             written.append((offset, len(data)))
+            completed.add(offset)  # Track progress in real-time
 
     async def _build_senders(self, dc_id, n: int) -> list[MTProtoSender]:
         """Create ``n`` connected senders to ``dc_id`` sharing one auth key.

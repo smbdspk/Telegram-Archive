@@ -219,7 +219,15 @@ async def download_and_shard_media(
     if os.path.exists(tmp_shared_file_path):
         os.remove(tmp_shared_file_path)
 
-    actual_path = await download_coro(tmp_shared_file_path)
+    try:
+        actual_path = await download_coro(tmp_shared_file_path)
+    except BaseException:
+        if os.path.exists(tmp_shared_file_path):
+            try:
+                os.remove(tmp_shared_file_path)
+            except OSError:
+                pass
+        raise
     tmp_shared_file_path = finalize_atomic_download(
         actual_path if isinstance(actual_path, str) else None,
         tmp_shared_file_path,

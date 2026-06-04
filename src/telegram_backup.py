@@ -135,11 +135,33 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
     that are not async iterators.  For ``iter_messages`` use
     ``iter_messages_with_flood_retry`` instead.
     """
+    backup_inst = getattr(coro_fn, "__self__", None)
+    dest_path = None
+    if backup_inst and hasattr(backup_inst, "_parallel_downloader") and len(args) > 1 and isinstance(args[1], str):
+        dest_path = args[1]
+
+    initial_progress = 0
+    if dest_path and backup_inst._parallel_downloader:
+        initial_progress = len(backup_inst._parallel_downloader._completed_offsets.get(dest_path, set()))
+
     retries = 0
     while True:
         try:
             return await coro_fn(*args, **kwargs)
         except FloodWaitError as e:
+            current_progress = 0
+            if dest_path and backup_inst and backup_inst._parallel_downloader:
+                current_progress = len(backup_inst._parallel_downloader._completed_offsets.get(dest_path, set()))
+
+            if current_progress > initial_progress:
+                logger.info(
+                    "FloodWait: progress was made during attempt (downloaded %d -> %d chunks), resetting retry counter",
+                    initial_progress,
+                    current_progress,
+                )
+                retries = 0
+                initial_progress = current_progress
+
             retries += 1
             if retries > max_retries:
                 logger.error(
@@ -1786,35 +1808,43 @@ class TelegramBackup:
                 if not os.path.lexists(file_path):
                     task_id = id(asyncio.current_task()) if asyncio.current_task() else 0
                     tmp_file_path = f"{file_path}.{os.getpid()}.{task_id}.part"
+                    if os.path.exists(tmp_file_path):
+                        os.remove(tmp_file_path)
                     timeout = getattr(self.config, "download_timeout_seconds", 3600)
                     timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
-                    for attempt in range(3):
-                        # Clear any partial file from a prior attempt so each retry starts clean.
-                        if os.path.exists(tmp_file_path):
-                            os.remove(tmp_file_path)
-                        try:
-                            actual_path = await asyncio.wait_for(
-                                call_with_flood_retry(self._fetch_media_bytes, message, tmp_file_path, file_size),
-                                timeout=timeout_val,
-                            )
-                            break
-                        except FileReferenceExpiredError:
-                            logger.info(f"File reference expired for message {message.id}, refreshing...")
-                            fresh_messages = await call_with_flood_retry(
-                                self.client.get_messages, chat_id, ids=[message.id]
-                            )
-                            if fresh_messages and fresh_messages[0]:
-                                message = fresh_messages[0]
-                                continue
-                            raise
-                        except TimeoutError:
-                            logger.error(
-                                f"Download timed out after {timeout} seconds for message {message.id} (attempt {attempt + 1}/3)"
-                            )
-                            if attempt == 2:
+                    try:
+                        for attempt in range(3):
+                            try:
+                                actual_path = await asyncio.wait_for(
+                                    call_with_flood_retry(self._fetch_media_bytes, message, tmp_file_path, file_size),
+                                    timeout=timeout_val,
+                                )
+                                break
+                            except FileReferenceExpiredError:
+                                logger.info(f"File reference expired for message {message.id}, refreshing...")
+                                fresh_messages = await call_with_flood_retry(
+                                    self.client.get_messages, chat_id, ids=[message.id]
+                                )
+                                if fresh_messages and fresh_messages[0]:
+                                    message = fresh_messages[0]
+                                    continue
                                 raise
-                    else:
-                        raise FileReferenceExpiredError(request=None)
+                            except TimeoutError:
+                                logger.error(
+                                    f"Download timed out after {timeout} seconds for message {message.id} (attempt {attempt + 1}/3)"
+                                )
+                                if attempt == 2:
+                                    raise
+                        else:
+                            raise FileReferenceExpiredError(request=None)
+                    except BaseException:
+                        # Clean up the partial file if the download fully fails
+                        if os.path.exists(tmp_file_path):
+                            try:
+                                os.remove(tmp_file_path)
+                            except OSError:
+                                pass
+                        raise
                     file_path = finalize_atomic_download(
                         actual_path if isinstance(actual_path, str) else None,
                         tmp_file_path,
