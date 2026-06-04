@@ -135,14 +135,22 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
     that are not async iterators.  For ``iter_messages`` use
     ``iter_messages_with_flood_retry`` instead.
     """
+    progress_fn = kwargs.pop("progress_fn", None)
     backup_inst = getattr(coro_fn, "__self__", None)
     dest_path = None
     if backup_inst and hasattr(backup_inst, "_parallel_downloader") and len(args) > 1 and isinstance(args[1], str):
         dest_path = args[1]
 
     initial_progress = 0
-    if dest_path and backup_inst._parallel_downloader:
-        initial_progress = len(backup_inst._parallel_downloader._completed_offsets.get(dest_path, set()))
+    if progress_fn:
+        initial_progress = progress_fn()
+    elif dest_path and backup_inst and getattr(backup_inst, "_parallel_downloader", None):
+        downloader = backup_inst._parallel_downloader
+        if downloader:
+            if hasattr(downloader, "get_completed_count"):
+                initial_progress = downloader.get_completed_count(dest_path)
+            elif hasattr(downloader, "_completed_offsets"):
+                initial_progress = len(downloader._completed_offsets.get(dest_path, set()))
 
     retries = 0
     while True:
@@ -150,8 +158,15 @@ async def call_with_flood_retry(coro_fn, *args, max_retries=MAX_FLOOD_RETRIES, *
             return await coro_fn(*args, **kwargs)
         except FloodWaitError as e:
             current_progress = 0
-            if dest_path and backup_inst and backup_inst._parallel_downloader:
-                current_progress = len(backup_inst._parallel_downloader._completed_offsets.get(dest_path, set()))
+            if progress_fn:
+                current_progress = progress_fn()
+            elif dest_path and backup_inst and getattr(backup_inst, "_parallel_downloader", None):
+                downloader = backup_inst._parallel_downloader
+                if downloader:
+                    if hasattr(downloader, "get_completed_count"):
+                        current_progress = downloader.get_completed_count(dest_path)
+                    elif hasattr(downloader, "_completed_offsets"):
+                        current_progress = len(downloader._completed_offsets.get(dest_path, set()))
 
             if current_progress > initial_progress:
                 logger.info(
@@ -1761,7 +1776,17 @@ class TelegramBackup:
                     for attempt in range(3):
                         try:
                             return await asyncio.wait_for(
-                                call_with_flood_retry(self._fetch_media_bytes, message, tmp_path, file_size),
+                                call_with_flood_retry(
+                                    self._fetch_media_bytes,
+                                    message,
+                                    tmp_path,
+                                    file_size,
+                                    progress_fn=lambda: (
+                                        self._parallel_downloader.get_completed_count(tmp_path)
+                                        if getattr(self, "_parallel_downloader", None)
+                                        else 0
+                                    ),
+                                ),
                                 timeout=timeout_val,
                             )
                         except FileReferenceExpiredError:
@@ -1816,7 +1841,17 @@ class TelegramBackup:
                         for attempt in range(3):
                             try:
                                 actual_path = await asyncio.wait_for(
-                                    call_with_flood_retry(self._fetch_media_bytes, message, tmp_file_path, file_size),
+                                    call_with_flood_retry(
+                                        self._fetch_media_bytes,
+                                        message,
+                                        tmp_file_path,
+                                        file_size,
+                                        progress_fn=lambda: (
+                                            self._parallel_downloader.get_completed_count(tmp_file_path)
+                                            if getattr(self, "_parallel_downloader", None)
+                                            else 0
+                                        ),
+                                    ),
                                     timeout=timeout_val,
                                 )
                                 break

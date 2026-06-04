@@ -147,6 +147,10 @@ class ParallelDownloader:
         self._max_file_size = int(max_file_size) if max_file_size and max_file_size > 0 else None
         self._completed_offsets: dict[str, set[int]] = {}
 
+    def get_completed_count(self, dest_path: str) -> int:
+        """Return the number of completed chunks for ``dest_path``."""
+        return len(self._completed_offsets.get(dest_path, set()))
+
     async def download_media(self, message, file) -> str:
         """Download ``message``'s media to path ``file`` and return ``file``.
 
@@ -179,33 +183,39 @@ class ParallelDownloader:
     async def _download_location(self, location, dc_id, file_size: int, dest_path: str) -> None:
         completed = self._completed_offsets.setdefault(dest_path, set())
 
-        # Reset tracking if the file does not exist on disk
-        if not os.path.exists(dest_path):
-            completed.clear()
-
-        offsets = list(range(0, file_size, self._part_size))
-
-        # Populate initial written list with already completed offsets
-        written: list[tuple[int, int]] = []
-        for off in completed:
-            chunk_len = min(self._part_size, file_size - off)
-            written.append((off, chunk_len))
-
-        # Only queue offsets that have not been completed yet
-        queue: asyncio.Queue[int] = asyncio.Queue()
-        pending_offsets = [off for off in offsets if off not in completed]
-        for off in pending_offsets:
-            queue.put_nowait(off)
-
         senders: list[MTProtoSender] = []
-        # O_NOFOLLOW (where available) refuses to follow a pre-planted symlink at
-        # dest_path, so a shared/world-writable media dir can't redirect our write.
-        # Include O_BINARY on Windows to prevent translation of \n to \r\n.
-        # Omit O_TRUNC to allow resuming.
-        open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(dest_path, open_flags, 0o644)
+        fd = -1
         try:
-            os.ftruncate(fd, file_size)
+            exists = os.path.exists(dest_path)
+            if not exists:
+                completed.clear()
+
+            # O_NOFOLLOW (where available) refuses to follow a pre-planted symlink at
+            # dest_path, so a shared/world-writable media dir can't redirect our write.
+            # Include O_BINARY on Windows to prevent translation of \n to \r\n.
+            # Omit O_TRUNC to allow resuming.
+            open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(dest_path, open_flags, 0o644)
+
+            current_size = os.fstat(fd).st_size
+            if not exists or current_size != file_size:
+                completed.clear()
+                os.ftruncate(fd, file_size)
+
+            offsets = list(range(0, file_size, self._part_size))
+
+            # Populate initial written list with already completed offsets
+            written: list[tuple[int, int]] = []
+            for off in completed:
+                chunk_len = min(self._part_size, file_size - off)
+                written.append((off, chunk_len))
+
+            # Only queue offsets that have not been completed yet
+            queue: asyncio.Queue[int] = asyncio.Queue()
+            pending_offsets = [off for off in offsets if off not in completed]
+            for off in pending_offsets:
+                queue.put_nowait(off)
+
             n = min(self._connections, len(pending_offsets)) or 1
             senders = await self._build_senders(dc_id, n)
 
@@ -228,12 +238,13 @@ class ParallelDownloader:
             # Success! Clear completed tracking for this path.
             self._completed_offsets.pop(dest_path, None)
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                # Closing the fd must never mask the original chunk failure.
-                pass
-            fd = -1
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    # Closing the fd must never mask the original chunk failure.
+                    pass
+                fd = -1
             # DO NOT delete the file on exceptions here, so we can resume it.
             # The outer backup layer is responsible for cleanup if the download fully fails.
             raise
