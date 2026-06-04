@@ -25,10 +25,20 @@ services:
       BACKUP_PATH: /data/backups
       DOWNLOAD_MEDIA: ${DOWNLOAD_MEDIA:-true}
       MAX_MEDIA_SIZE_MB: ${MAX_MEDIA_SIZE_MB:-100}
+      # DOWNLOAD_TIMEOUT_SECONDS: ${DOWNLOAD_TIMEOUT_SECONDS:-3600}
+      
+      # Parallel chunked downloads (advanced)
+      # PARALLEL_DOWNLOAD_ENABLED: ${PARALLEL_DOWNLOAD_ENABLED:-false}
+      # PARALLEL_DOWNLOAD_MIN_SIZE_MB: ${PARALLEL_DOWNLOAD_MIN_SIZE_MB:-20}
+      # PARALLEL_DOWNLOAD_CONNECTIONS: ${PARALLEL_DOWNLOAD_CONNECTIONS:-4}
+      # PARALLEL_DOWNLOAD_PART_SIZE_KB: ${PARALLEL_DOWNLOAD_PART_SIZE_KB:-512}
+      
       BATCH_SIZE: ${BATCH_SIZE:-100}
+      # FILL_GAPS: ${FILL_GAPS:-false}
+      # GAP_THRESHOLD: ${GAP_THRESHOLD:-50}
       CHECKPOINT_INTERVAL: ${CHECKPOINT_INTERVAL:-1}
       # DEDUPLICATE_MEDIA: ${DEDUPLICATE_MEDIA:-true}
-      # PRIORITY_CHAT_IDS: ${PRIORITY_CHAT_IDS:-}
+      PRIORITY_CHAT_IDS: ${PRIORITY_CHAT_IDS:-}
       # SKIP_MEDIA_CHAT_IDS: ${SKIP_MEDIA_CHAT_IDS:-}
       # SKIP_MEDIA_DELETE_EXISTING: ${SKIP_MEDIA_DELETE_EXISTING:-true}
       SKIP_TOPIC_IDS: ${SKIP_TOPIC_IDS:-}
@@ -62,6 +72,7 @@ services:
       # Option 2: Individual settings
       DB_TYPE: ${DB_TYPE:-sqlite}
       DB_PATH: ${DB_PATH:-/data/backups/telegram_backup.db}
+      # DATABASE_TIMEOUT: ${DATABASE_TIMEOUT:-60.0}
       # PostgreSQL settings (when DB_TYPE=postgresql or using DATABASE_URL)
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
@@ -137,6 +148,11 @@ services:
       ALLOW_ANONYMOUS_VIEWER: ${ALLOW_ANONYMOUS_VIEWER:-false}
       AUTH_SESSION_DAYS: ${AUTH_SESSION_DAYS:-30}
 
+      # Multi-User / Proxy Auth Configuration
+      # AUTH_PROXY_HEADER: ${AUTH_PROXY_HEADER:-}
+      # AUTH_PROXY_ADMIN_USERS: ${AUTH_PROXY_ADMIN_USERS:-}
+      # AUTH_PROXY_DEFAULT_ACCESS: ${AUTH_PROXY_DEFAULT_ACCESS:-none}
+
       # Display
       VIEWER_TIMEZONE: ${VIEWER_TIMEZONE:-Europe/Madrid}
       SHOW_STATS: ${SHOW_STATS:-true}
@@ -144,14 +160,13 @@ services:
       # DISPLAY_CHAT_IDS: ${DISPLAY_CHAT_IDS:-}
 
       # Security
-      # CORS_ORIGINS: comma-separated allowed origins (default: * = allow all)
       # CORS_ORIGINS: ${CORS_ORIGINS:-*}
-      # SECURE_COOKIES: auto-detect from protocol; override with true/false
       # SECURE_COOKIES: ${SECURE_COOKIES:-}
       TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
       INTERNAL_PUSH_SECRET: ${INTERNAL_PUSH_SECRET:-}
 
       # Notifications
+      # ENABLE_NOTIFICATIONS: ${ENABLE_NOTIFICATIONS:-false}
       # PUSH_NOTIFICATIONS: ${PUSH_NOTIFICATIONS:-basic}
       # VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       # VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
@@ -162,6 +177,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       DB_TYPE: ${DB_TYPE:-sqlite}
       DB_PATH: ${DB_PATH:-/data/backups/telegram_backup.db}
+      # DATABASE_TIMEOUT: ${DATABASE_TIMEOUT:-60.0}
       POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_USER: ${POSTGRES_USER:-telegram}
