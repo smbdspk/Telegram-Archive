@@ -44,6 +44,7 @@ from .message_utils import (
     resolve_shared_file_path,
     sanitize_media_filename,
 )
+from .parallel_download import PARALLEL_DOWNLOAD_AVAILABLE, download_file_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -1726,12 +1727,38 @@ class TelegramBackup:
                     nonlocal message
                     timeout = getattr(self.config, "download_timeout_seconds", 3600)
                     timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
+
+                    # Route large non-photo files through parallel download
+                    min_size = getattr(self.config, "parallel_download_min_size_mb", 15) * 1024 * 1024
+                    use_parallel = (
+                        PARALLEL_DOWNLOAD_AVAILABLE
+                        and getattr(self.config, "parallel_download_enabled", False)
+                        and file_size
+                        and file_size >= min_size
+                        and media_type != "photo"
+                    )
+
                     for attempt in range(3):
                         try:
-                            return await asyncio.wait_for(
-                                call_with_flood_retry(self.client.download_media, message, tmp_path),
-                                timeout=timeout_val,
-                            )
+                            if use_parallel:
+                                return await asyncio.wait_for(
+                                    download_file_parallel(
+                                        client=self.client,
+                                        message=message,
+                                        output_path=tmp_path,
+                                        file_size=file_size,
+                                        workers=getattr(self.config, "parallel_download_workers", 4),
+                                        part_size=getattr(self.config, "parallel_download_part_size_kb", 1024) * 1024,
+                                        max_flood_retries=MAX_FLOOD_RETRIES,
+                                        max_flood_wait_seconds=MAX_FLOOD_WAIT_SECONDS,
+                                    ),
+                                    timeout=timeout_val,
+                                )
+                            else:
+                                return await asyncio.wait_for(
+                                    call_with_flood_retry(self.client.download_media, message, tmp_path),
+                                    timeout=timeout_val,
+                                )
                         except FileReferenceExpiredError:
                             logger.info(f"File reference expired for message {message.id}, refreshing...")
                             fresh_messages = await call_with_flood_retry(

@@ -288,6 +288,23 @@ class Config:
         self.deduplicate_media = os.getenv("DEDUPLICATE_MEDIA", "true").lower() == "true"
 
         # =====================================================================
+        # PARALLEL DOWNLOAD (large files only, backup path only)
+        # =====================================================================
+        # When enabled, files above PARALLEL_DOWNLOAD_MIN_SIZE_MB are downloaded
+        # using multiple concurrent MTProto senders to the target DC.
+        # Default OFF — photos and small files always use single-stream.
+        self.parallel_download_enabled = _parse_bool(os.getenv("PARALLEL_DOWNLOAD_ENABLED"), default=False)
+        self.parallel_download_min_size_mb = int(os.getenv("PARALLEL_DOWNLOAD_MIN_SIZE_MB", "15"))
+        self.parallel_download_workers = min(
+            int(os.getenv("PARALLEL_DOWNLOAD_WORKERS", "4")),
+            8,  # Hard cap — stay well under Telegram's ~20 connection cliff
+        )
+        self.parallel_download_part_size_kb = min(
+            int(os.getenv("PARALLEL_DOWNLOAD_PART_SIZE_KB", "1024")),
+            1024,  # Telegram API maximum for upload.getFile limit
+        )
+
+        # =====================================================================
         # ZERO-FOOTPRINT MASS OPERATION PROTECTION
         # =====================================================================
         # Operations are BUFFERED before being applied. If a burst is detected,
@@ -378,6 +395,14 @@ class Config:
         if self.skip_topic_ids:
             total_topics = sum(len(t) for t in self.skip_topic_ids.values())
             logger.info(f"Topic filtering: skipping {total_topics} topic(s) across {len(self.skip_topic_ids)} chat(s)")
+        if self.parallel_download_enabled:
+            peak_mem_kb = self.parallel_download_workers * self.parallel_download_part_size_kb
+            logger.info(
+                f"Parallel download: {self.parallel_download_workers} workers, "
+                f"min {self.parallel_download_min_size_mb}MB, "
+                f"part {self.parallel_download_part_size_kb}KB "
+                f"(peak ~{peak_mem_kb}KB)"
+            )
         if self.telegram_proxy:
             logger.info("Telegram proxy enabled (type=socks5, rdns=%s)", self.telegram_proxy["rdns"])
             logger.debug(
@@ -579,6 +604,10 @@ class Config:
     def get_max_media_size_bytes(self) -> int:
         """Get maximum media file size in bytes."""
         return self.max_media_size_mb * 1024 * 1024
+
+    def get_parallel_download_min_size_bytes(self) -> int:
+        """Get minimum file size for parallel download in bytes."""
+        return self.parallel_download_min_size_mb * 1024 * 1024
 
     def should_download_media_for_chat(self, chat_id: int) -> bool:
         """
