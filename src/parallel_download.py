@@ -8,9 +8,10 @@ configurable size threshold; small files use the proven single-stream
 Peak memory ≈ workers × part_size (default: 4 × 1 MB = 4 MB).
 
 Private Telethon APIs used (isolated in this module):
-    - ``client._borrow_sender(dc_id)``
+    - ``client._borrow_exported_sender(dc_id)``
+    - ``client._return_exported_sender(sender)``
 
-These are stable across Telethon 1.37 – 1.42+ but could break in a
+These are stable across Telethon 1.37 – 1.43+ but could break in a
 future major version.  If unavailable, ``PARALLEL_DOWNLOAD_AVAILABLE``
 is ``False`` and the feature silently disables.
 """
@@ -35,8 +36,9 @@ try:
     from telethon.tl.functions.upload import GetFileRequest
     from telethon.tl.types import upload as upload_types
 
-    if not hasattr(TelegramClient, "_borrow_sender"):
-        raise AttributeError("TelegramClient._borrow_sender not found")
+    for _required in ("_borrow_exported_sender", "_return_exported_sender"):
+        if not hasattr(TelegramClient, _required):
+            raise AttributeError(f"TelegramClient.{_required} not found")
 
     PARALLEL_DOWNLOAD_AVAILABLE = True
 except (ImportError, AttributeError) as _probe_err:  # pragma: no cover
@@ -46,9 +48,28 @@ except (ImportError, AttributeError) as _probe_err:  # pragma: no cover
         _probe_err,
     )
 
-# Telegram API maximum for GetFileRequest *limit* parameter.
+# Telegram constraints on the GetFileRequest *limit* parameter:
+#   * must be a multiple of 4 KB (4096),
+#   * a single request must not cross a 1 MB boundary, i.e. ``limit`` must
+#     divide 1 MB evenly.
+# Both hold for every power of two in [4 KB, 1 MB], so part sizes are snapped
+# down to a power of two (see ``_align_part_size``).
 _MAX_REQUEST_SIZE = 1024 * 1024  # 1 MB
 _MIN_REQUEST_SIZE = 4096  # 4 KB – alignment requirement
+
+
+def _align_part_size(part_size: int) -> int:
+    """Snap *part_size* down to a power of two in ``[4 KB, 1 MB]``.
+
+    A power of two is always a multiple of 4 KB and an even divisor of 1 MB,
+    so no ``GetFileRequest`` ever crosses a 1 MB boundary (which Telegram
+    rejects with ``LIMIT_INVALID``).
+    """
+    part_size = max(_MIN_REQUEST_SIZE, min(part_size, _MAX_REQUEST_SIZE))
+    aligned = _MIN_REQUEST_SIZE
+    while aligned * 2 <= part_size:
+        aligned *= 2
+    return aligned
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +78,12 @@ _MIN_REQUEST_SIZE = 4096  # 4 KB – alignment requirement
 class FloodBudget:
     """Shared flood-wait budget across all parallel workers.
 
-    Tracks cumulative retries and wait time against the caller's limits
-    (``MAX_FLOOD_RETRIES`` / ``MAX_FLOOD_WAIT_SECONDS``).  When any
-    worker hits ``FloodWaitError``, **all** sibling workers pause via an
-    ``asyncio.Event`` until the mandatory wait completes.
+    Caps the number of retries (``MAX_FLOOD_RETRIES``) and the duration of
+    any single flood wait (``MAX_FLOOD_WAIT_SECONDS``) — matching the
+    semantics of ``call_with_flood_retry`` on the single-stream path.  When
+    any worker hits ``FloodWaitError``, **all** sibling workers pause via an
+    ``asyncio.Event`` until *every* in-flight flood wait completes (tracked
+    with a pause-depth counter so concurrent floods don't resume early).
     """
 
     def __init__(self, max_retries: int, max_wait_seconds: int) -> None:
@@ -68,6 +91,7 @@ class FloodBudget:
         self.max_wait_seconds = max_wait_seconds
         self._total_retries = 0
         self._total_wait_seconds = 0.0
+        self._pause_depth = 0
         self._lock = asyncio.Lock()
         self._resume = asyncio.Event()
         self._resume.set()  # not paused initially
@@ -93,6 +117,7 @@ class FloodBudget:
                 self._resume.set()  # wake waiters so they can exit
                 return False
             # Pause all workers for the duration of the flood wait.
+            self._pause_depth += 1
             self._resume.clear()
 
         jitter = random.uniform(0.5, 2.0)
@@ -106,7 +131,13 @@ class FloodBudget:
             self._total_wait_seconds,
         )
         await asyncio.sleep(effective_wait)
-        self._resume.set()  # resume all workers
+
+        async with self._lock:
+            self._pause_depth -= 1
+            # Only resume once the last concurrent flood wait has elapsed, so a
+            # short wait can't un-pause siblings still inside a longer one.
+            if self._pause_depth == 0 and not self._cancelled:
+                self._resume.set()
         return True
 
     async def wait_if_paused(self) -> None:
@@ -176,13 +207,23 @@ async def _download_chunk(
     sender,
     input_location,
     offset: int,
-    chunk_size: int,
+    request_limit: int,
+    expected_len: int,
     flood_budget: FloodBudget,
     cancel_event: asyncio.Event,
 ) -> bytes | None:
     """Download a single chunk with flood-wait handling.
 
-    Returns chunk bytes, or ``None`` if the download was cancelled.
+    ``request_limit`` is the (4 KB-aligned, 1 MB-dividing) ``limit`` sent to
+    Telegram; the server returns up to that many bytes.  ``expected_len`` is
+    how many bytes this part should actually contain — ``request_limit`` for
+    every part except the last, where it is the file remainder.  Telegram is
+    always asked for the aligned ``request_limit`` (a bare remainder would be
+    rejected as ``LIMIT_INVALID``) and the response is trimmed/validated
+    against ``expected_len``.
+
+    Returns chunk bytes (exactly ``expected_len`` long), or ``None`` if the
+    download was cancelled.
     """
     while True:
         if cancel_event.is_set() or flood_budget.cancelled:
@@ -192,7 +233,7 @@ async def _download_chunk(
                 GetFileRequest(
                     location=input_location,
                     offset=offset,
-                    limit=chunk_size,
+                    limit=request_limit,
                 )
             )
         except FloodWaitError as e:
@@ -213,9 +254,17 @@ async def _download_chunk(
         data = result.bytes
         if not data:
             cancel_event.set()
-            raise RuntimeError(f"Empty response at offset {offset} (expected {chunk_size} bytes)")
+            raise RuntimeError(f"Empty response at offset {offset} (expected {expected_len} bytes)")
 
-        return data
+        # The server may return up to ``request_limit`` bytes; the final part
+        # only needs ``expected_len``.  A response shorter than expected means
+        # the file is smaller than its declared size — a hard error, since the
+        # missing bytes would leave a gap that verification would reject.
+        if len(data) < expected_len:
+            cancel_event.set()
+            raise RuntimeError(f"Short read at offset {offset}: got {len(data)} bytes, expected {expected_len}")
+
+        return data[:expected_len]
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +299,7 @@ async def download_file_parallel(
         file_size: Expected file size in bytes (from Telegram metadata).
         workers: Concurrent download workers (hard max 8).
         part_size: Bytes per ``GetFileRequest``.
-            Capped at 1 MB (Telegram API limit), aligned to 4 096.
+            Snapped down to a power of two in [4 KB, 1 MB] (Telegram limit).
         max_flood_retries: Max flood-wait retries (shared budget).
         max_flood_wait_seconds: Max single flood-wait duration.
 
@@ -270,8 +319,7 @@ async def download_file_parallel(
 
     # Clamp parameters
     workers = max(1, min(workers, 8))
-    part_size = max(_MIN_REQUEST_SIZE, min(part_size, _MAX_REQUEST_SIZE))
-    part_size = (part_size // _MIN_REQUEST_SIZE) * _MIN_REQUEST_SIZE  # 4 KB align
+    part_size = _align_part_size(part_size)
 
     # Extract InputFileLocation and DC from message media
     media = message.media
@@ -308,20 +356,29 @@ async def download_file_parallel(
     range_tracker = ByteRangeTracker(file_size)
     cancel_event = asyncio.Event()
 
+    # Borrowing an exported sender for the client's *own* DC raises
+    # ``DcIdInvalidError``; Telethon uses the main sender in that case.
+    session_dc = getattr(getattr(client, "session", None), "dc_id", None)
+    use_exported = bool(dc_id) and session_dc != dc_id
+
     senders: list = []
     try:
-        # Borrow senders for the target DC.
-        # Multiple calls may return the same sender (request-pipelining)
-        # or distinct connections — either way, concurrent send() works.
-        for _ in range(workers):
-            sender = await client._borrow_sender(dc_id)
-            senders.append(sender)
+        if use_exported:
+            # Borrow exported senders for the target DC.  Telethon caches one
+            # sender per DC and reference-counts borrows, so these calls return
+            # the same underlying connection and MUST each be returned below.
+            for _ in range(workers):
+                sender = await client._borrow_exported_sender(dc_id)
+                senders.append(sender)
+        else:
+            # Media lives on the home DC — reuse the main sender (no borrow).
+            senders = [client._sender] * workers
 
         # Divide parts into contiguous ranges per worker
         parts_per_worker = total_parts // workers
         remainder = total_parts % workers
 
-        async def _worker(worker_id: int, sender, start_part: int, end_part: int) -> None:
+        async def _worker(sender, start_part: int, end_part: int) -> None:
             """Download an assigned contiguous range of parts."""
             # Each worker opens its own fd → independent seek position
             with open(output_path_str, "r+b") as f:
@@ -334,13 +391,14 @@ async def download_file_parallel(
                         return
 
                     offset = part_idx * part_size
-                    chunk_size = min(part_size, file_size - offset)
+                    expected_len = min(part_size, file_size - offset)
 
                     data = await _download_chunk(
                         sender,
                         input_location,
                         offset,
-                        chunk_size,
+                        part_size,
+                        expected_len,
                         flood_budget,
                         cancel_event,
                     )
@@ -362,7 +420,7 @@ async def download_file_parallel(
             if n_parts > 0:
                 tasks.append(
                     asyncio.create_task(
-                        _worker(i, senders[i], current_part, current_part + n_parts),
+                        _worker(senders[i], current_part, current_part + n_parts),
                         name=f"parallel-dl-worker-{i}",
                     )
                 )
@@ -399,3 +457,14 @@ async def download_file_parallel(
         except OSError:
             pass
         raise
+
+    finally:
+        # Return every borrowed sender so Telethon can reference-count and
+        # eventually disconnect it.  The home-DC main sender is never borrowed,
+        # so it is not returned here.
+        if use_exported:
+            for sender in senders:
+                try:
+                    await client._return_exported_sender(sender)
+                except Exception as release_err:  # pragma: no cover - defensive
+                    logger.debug("Failed to return borrowed sender: %s", release_err)

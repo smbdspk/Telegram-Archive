@@ -20,6 +20,7 @@ from src.parallel_download import (
     _MAX_REQUEST_SIZE,
     ByteRangeTracker,
     FloodBudget,
+    _align_part_size,
     download_file_parallel,
 )
 
@@ -134,6 +135,57 @@ class TestFloodBudget:
         budget.cancel()
         assert budget.cancelled
 
+    async def test_concurrent_pause_not_resumed_early(self, mock_sleep, mock_uniform):
+        """A short flood wait must not un-pause siblings while a longer
+        concurrent wait is still in progress (pause-depth coordination)."""
+        budget = FloodBudget(max_retries=5, max_wait_seconds=3600)
+
+        # Two overlapping floods: increment depth twice before either resumes.
+        async with budget._lock:
+            budget._pause_depth += 1
+            budget._resume.clear()
+        async with budget._lock:
+            budget._pause_depth += 1
+
+        # First (short) wait completes: depth 2 → 1, still paused.
+        async with budget._lock:
+            budget._pause_depth -= 1
+            if budget._pause_depth == 0 and not budget._cancelled:
+                budget._resume.set()
+        assert not budget._resume.is_set()  # siblings remain paused
+
+        # Second (long) wait completes: depth 1 → 0, now resumed.
+        async with budget._lock:
+            budget._pause_depth -= 1
+            if budget._pause_depth == 0 and not budget._cancelled:
+                budget._resume.set()
+        assert budget._resume.is_set()
+
+
+# ---------------------------------------------------------------------------
+# _align_part_size
+# ---------------------------------------------------------------------------
+class TestAlignPartSize:
+    """Part sizes must be snapped to a power of two in [4 KB, 1 MB] so that no
+    GetFileRequest crosses a 1 MB boundary (Telegram LIMIT_INVALID)."""
+
+    def test_divisor_of_1mb_preserved(self):
+        for kb in (4, 8, 16, 32, 64, 128, 256, 512, 1024):
+            size = kb * 1024
+            assert _align_part_size(size) == size
+            assert (1024 * 1024) % _align_part_size(size) == 0
+
+    def test_non_divisor_snapped_down(self):
+        # 100 KB is a multiple of 4 KB but NOT a divisor of 1 MB.
+        aligned = _align_part_size(100 * 1024)
+        assert aligned == 64 * 1024
+        assert (1024 * 1024) % aligned == 0
+
+    def test_clamped_to_bounds(self):
+        assert _align_part_size(1) == 4096
+        assert _align_part_size(5 * 1024 * 1024) == _MAX_REQUEST_SIZE
+        assert _align_part_size(5000) == 4096
+
 
 # ---------------------------------------------------------------------------
 # download_file_parallel
@@ -150,7 +202,10 @@ class TestDownloadFileParallel:
         self.client = MagicMock()
         self.mock_sender = MagicMock()
         self.mock_sender.send = AsyncMock()
-        self.client._borrow_sender = AsyncMock(return_value=self.mock_sender)
+        # Force the exported-sender path: session DC differs from media DC (2).
+        self.client.session.dc_id = 99
+        self.client._borrow_exported_sender = AsyncMock(return_value=self.mock_sender)
+        self.client._return_exported_sender = AsyncMock()
 
         # Mock message with document media
         self.message = MagicMock()
@@ -355,8 +410,8 @@ class TestDownloadFileParallel:
             part_size=_MAX_REQUEST_SIZE,
         )
 
-        # _borrow_sender should be called at most 8 times (capped)
-        assert self.client._borrow_sender.await_count <= 8
+        # _borrow_exported_sender should be called at most 8 times (capped)
+        assert self.client._borrow_exported_sender.await_count <= 8
         assert result == self.output_path
 
     @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
@@ -403,6 +458,144 @@ class TestDownloadFileParallel:
         # Check the GetFileRequest limit parameter used
         call_args = self.mock_sender.send.call_args[0][0]
         assert call_args.limit == 4096
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_final_chunk_unaligned_size(self, mock_utils, mock_sleep):
+        """File size not a multiple of part_size → final request still uses the
+        aligned limit (part_size), and the short EOF response is written intact."""
+        part_size = 4096
+        file_size = 10000  # 3 parts: 4096 + 4096 + 1808 (final unaligned)
+        mock_utils.get_input_location.return_value = (2, self.mock_location)
+
+        self.mock_sender.send = AsyncMock(
+            side_effect=[
+                self._make_send_result(b"A" * 4096),
+                self._make_send_result(b"B" * 4096),
+                self._make_send_result(b"C" * 1808),  # server returns remainder
+            ]
+        )
+
+        result = await download_file_parallel(
+            self.client,
+            self.message,
+            self.output_path,
+            file_size,
+            workers=1,
+            part_size=part_size,
+        )
+
+        assert result == self.output_path
+        with open(self.output_path, "rb") as f:
+            content = f.read()
+        assert len(content) == file_size
+        assert content == b"A" * 4096 + b"B" * 4096 + b"C" * 1808
+        # Every request must use the aligned limit, never the bare remainder.
+        for call in self.mock_sender.send.call_args_list:
+            assert call.args[0].limit == part_size
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_oversized_response_trimmed(self, mock_utils, mock_sleep):
+        """Server returns a full aligned chunk for the final part → trimmed to
+        the expected remainder so the file isn't over-written past EOF."""
+        part_size = 4096
+        file_size = 6000  # 2 parts: 4096 + 1904
+        mock_utils.get_input_location.return_value = (2, self.mock_location)
+
+        self.mock_sender.send = AsyncMock(
+            side_effect=[
+                self._make_send_result(b"A" * 4096),
+                self._make_send_result(b"B" * 4096),  # over-long; expect trim to 1904
+            ]
+        )
+
+        result = await download_file_parallel(
+            self.client,
+            self.message,
+            self.output_path,
+            file_size,
+            workers=1,
+            part_size=part_size,
+        )
+
+        assert result == self.output_path
+        assert os.path.getsize(self.output_path) == file_size
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_short_read_raises(self, mock_utils, mock_sleep):
+        """A non-final chunk shorter than expected → RuntimeError, file cleaned."""
+        part_size = 4096
+        file_size = 8192  # 2 full parts expected
+        mock_utils.get_input_location.return_value = (2, self.mock_location)
+
+        self.mock_sender.send = AsyncMock(
+            side_effect=[
+                self._make_send_result(b"A" * 4096),
+                self._make_send_result(b"B" * 100),  # short read on a full part
+            ]
+        )
+
+        with pytest.raises(RuntimeError, match="Short read"):
+            await download_file_parallel(
+                self.client,
+                self.message,
+                self.output_path,
+                file_size,
+                workers=1,
+                part_size=part_size,
+            )
+        assert not os.path.exists(self.output_path)
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_senders_returned_on_success(self, mock_utils, mock_sleep):
+        """Every borrowed sender is returned to Telethon's pool on success."""
+        file_size = 4096
+        mock_utils.get_input_location.return_value = (2, self.mock_location)
+        self.mock_sender.send = AsyncMock(return_value=self._make_send_result(b"X" * 4096))
+
+        await download_file_parallel(self.client, self.message, self.output_path, file_size, workers=1, part_size=4096)
+
+        borrowed = self.client._borrow_exported_sender.await_count
+        assert borrowed >= 1
+        assert self.client._return_exported_sender.await_count == borrowed
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_senders_returned_on_error(self, mock_utils, mock_sleep):
+        """Borrowed senders are returned even when the download fails."""
+        file_size = 4096
+        mock_utils.get_input_location.return_value = (2, self.mock_location)
+        self.mock_sender.send = AsyncMock(side_effect=ConnectionError("lost"))
+
+        with pytest.raises(ConnectionError):
+            await download_file_parallel(
+                self.client, self.message, self.output_path, file_size, workers=1, part_size=4096
+            )
+
+        borrowed = self.client._borrow_exported_sender.await_count
+        assert borrowed >= 1
+        assert self.client._return_exported_sender.await_count == borrowed
+
+    @patch("src.parallel_download.asyncio.sleep", new_callable=AsyncMock)
+    @patch("src.parallel_download.telethon_utils")
+    async def test_home_dc_uses_main_sender(self, mock_utils, mock_sleep):
+        """When media DC == session DC, the main sender is used (no borrow/return)."""
+        file_size = 4096
+        # get_input_location returns dc_id 99, matching the session DC set in setup.
+        mock_utils.get_input_location.return_value = (99, self.mock_location)
+        self.client._sender = self.mock_sender
+        self.mock_sender.send = AsyncMock(return_value=self._make_send_result(b"X" * 4096))
+
+        result = await download_file_parallel(
+            self.client, self.message, self.output_path, file_size, workers=1, part_size=4096
+        )
+
+        assert result == self.output_path
+        self.client._borrow_exported_sender.assert_not_awaited()
+        self.client._return_exported_sender.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

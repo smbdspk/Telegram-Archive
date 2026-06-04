@@ -1728,37 +1728,53 @@ class TelegramBackup:
                     timeout = getattr(self.config, "download_timeout_seconds", 3600)
                     timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
 
-                    # Route large non-photo files through parallel download
-                    min_size = getattr(self.config, "parallel_download_min_size_mb", 15) * 1024 * 1024
+                    # Route large non-photo files through parallel download.
+                    # ``is True`` keeps the numeric comparison below from running
+                    # against a non-bool (e.g. a mocked config) when disabled.
+                    parallel_enabled = getattr(self.config, "parallel_download_enabled", False) is True
+                    min_size_mb = getattr(self.config, "parallel_download_min_size_mb", 15)
                     use_parallel = (
                         PARALLEL_DOWNLOAD_AVAILABLE
-                        and getattr(self.config, "parallel_download_enabled", False)
-                        and file_size
-                        and file_size >= min_size
+                        and parallel_enabled
                         and media_type != "photo"
+                        and isinstance(file_size, int)
+                        and file_size >= min_size_mb * 1024 * 1024
                     )
 
                     for attempt in range(3):
                         try:
                             if use_parallel:
-                                return await asyncio.wait_for(
-                                    download_file_parallel(
-                                        client=self.client,
-                                        message=message,
-                                        output_path=tmp_path,
-                                        file_size=file_size,
-                                        workers=getattr(self.config, "parallel_download_workers", 4),
-                                        part_size=getattr(self.config, "parallel_download_part_size_kb", 1024) * 1024,
-                                        max_flood_retries=MAX_FLOOD_RETRIES,
-                                        max_flood_wait_seconds=MAX_FLOOD_WAIT_SECONDS,
-                                    ),
-                                    timeout=timeout_val,
-                                )
-                            else:
-                                return await asyncio.wait_for(
-                                    call_with_flood_retry(self.client.download_media, message, tmp_path),
-                                    timeout=timeout_val,
-                                )
+                                try:
+                                    return await asyncio.wait_for(
+                                        download_file_parallel(
+                                            client=self.client,
+                                            message=message,
+                                            output_path=tmp_path,
+                                            file_size=file_size,
+                                            workers=getattr(self.config, "parallel_download_workers", 4),
+                                            part_size=getattr(self.config, "parallel_download_part_size_kb", 1024)
+                                            * 1024,
+                                            max_flood_retries=MAX_FLOOD_RETRIES,
+                                            max_flood_wait_seconds=MAX_FLOOD_WAIT_SECONDS,
+                                        ),
+                                        timeout=timeout_val,
+                                    )
+                                except FileReferenceExpiredError, TimeoutError:
+                                    raise  # handled by the outer retry loop
+                                except Exception as parallel_err:
+                                    # Parallel engine failed (CDN redirect, short
+                                    # read, verification, transport). Don't lose the
+                                    # file — fall back to the proven single-stream
+                                    # path for the rest of this download.
+                                    logger.warning(
+                                        f"Parallel download failed for message {message.id}, "
+                                        f"falling back to single-stream: {parallel_err}"
+                                    )
+                                    use_parallel = False
+                            return await asyncio.wait_for(
+                                call_with_flood_retry(self.client.download_media, message, tmp_path),
+                                timeout=timeout_val,
+                            )
                         except FileReferenceExpiredError:
                             logger.info(f"File reference expired for message {message.id}, refreshing...")
                             fresh_messages = await call_with_flood_retry(
