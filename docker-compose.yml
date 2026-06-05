@@ -1,6 +1,6 @@
 services:
   telegram-backup:
-    image: drumsergio/telegram-archive:7.7.0
+    image: drumsergio/telegram-archive:latest
     container_name: telegram-backup
     restart: unless-stopped
     command: ["python", "-m", "src", "schedule"]
@@ -28,10 +28,10 @@ services:
       # DOWNLOAD_TIMEOUT_SECONDS: ${DOWNLOAD_TIMEOUT_SECONDS:-3600}
       
       # Parallel chunked downloads (advanced)
-      # PARALLEL_DOWNLOAD_ENABLED: ${PARALLEL_DOWNLOAD_ENABLED:-false}
-      # PARALLEL_DOWNLOAD_MIN_SIZE_MB: ${PARALLEL_DOWNLOAD_MIN_SIZE_MB:-20}
-      # PARALLEL_DOWNLOAD_CONNECTIONS: ${PARALLEL_DOWNLOAD_CONNECTIONS:-4}
-      # PARALLEL_DOWNLOAD_PART_SIZE_KB: ${PARALLEL_DOWNLOAD_PART_SIZE_KB:-512}
+      PARALLEL_DOWNLOAD_ENABLED: ${PARALLEL_DOWNLOAD_ENABLED:-false}
+      PARALLEL_DOWNLOAD_MIN_SIZE_MB: ${PARALLEL_DOWNLOAD_MIN_SIZE_MB:-20}
+      PARALLEL_DOWNLOAD_CONNECTIONS: ${PARALLEL_DOWNLOAD_CONNECTIONS:-4}
+      PARALLEL_DOWNLOAD_PART_SIZE_KB: ${PARALLEL_DOWNLOAD_PART_SIZE_KB:-512}
       
       BATCH_SIZE: ${BATCH_SIZE:-100}
       # FILL_GAPS: ${FILL_GAPS:-false}
@@ -131,7 +131,7 @@ services:
     #       memory: 512M
 
   telegram-viewer:
-    image: drumsergio/telegram-archive-viewer:7.7.0
+    image: drumsergio/telegram-archive-viewer:latest
     container_name: telegram-viewer
     restart: unless-stopped
     ports:
