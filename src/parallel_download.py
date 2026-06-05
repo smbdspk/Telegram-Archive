@@ -341,17 +341,13 @@ class ParallelDownloader:
         client = self._client
         dc = await client._get_dc(dc_id)
 
-        # We strictly disable auto-reconnect and retries for parallel workers.
-        # Rationale: When a transient sender experiences a connection drop or request failure,
-        # we do not want it to perform background auto-reconnections. Instead, we want it to
-        # fail immediately and cancel siblings, permitting the outer backup/retry logic
-        # (which manages a single/shared flood budget) to handle the retry from a clean state.
+        # Inherit connection settings from the parent client where available
         sender = MTProtoSender(
             auth_key,
             loggers=client._log,
-            retries=0,
-            delay=0,
-            auto_reconnect=False,
+            retries=getattr(client, "_connection_retries", 5),
+            delay=getattr(client, "_retry_delay", 1),
+            auto_reconnect=getattr(client, "_auto_reconnect", True),
             connect_timeout=getattr(client, "_timeout", 10),
         )
 
