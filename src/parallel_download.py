@@ -340,7 +340,48 @@ class ParallelDownloader:
     async def _connect_sender(self, dc_id, auth_key) -> MTProtoSender:
         client = self._client
         dc = await client._get_dc(dc_id)
-        sender = MTProtoSender(auth_key, loggers=client._log)
+
+        # Inherit connection settings from the parent client where available
+        sender = MTProtoSender(
+            auth_key,
+            loggers=client._log,
+            retries=getattr(client, "_connection_retries", 5),
+            delay=getattr(client, "_retry_delay", 1),
+            auto_reconnect=getattr(client, "_auto_reconnect", True),
+            connect_timeout=getattr(client, "_timeout", 10),
+        )
+
+        # Telethon race condition workaround (issue #183 / parallel download drop):
+        # If the sender drops connection, recv_loop queues a background _reconnect task.
+        # If we concurrently call sender.disconnect() (e.g. aborting the transfer due to an
+        # error), Telethon sets sender._connection = None. The background task then wakes up,
+        # calls await sender._connection.connect(), and crashes loudly with AttributeError.
+        # We patch _disconnect to leave a safe dummy connection in place instead of None.
+        original_disconnect = sender._disconnect
+
+        class DummyConnection:
+            async def disconnect(self):
+                pass
+
+            async def connect(self, timeout=None):
+                import asyncio
+
+                raise asyncio.CancelledError("Sender disconnected during reconnect")
+
+            def send(self, *args, **kwargs):
+                pass
+
+            async def recv(self, *args, **kwargs):
+                import asyncio
+
+                raise asyncio.CancelledError()
+
+        async def safe_disconnect(error=None):
+            await original_disconnect(error=error)
+            sender._connection = DummyConnection()
+
+        sender._disconnect = safe_disconnect
+
         await sender.connect(
             client._connection(
                 dc.ip_address,
