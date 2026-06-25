@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodPremiumWaitError, FloodWaitError
 
 
 def _patch_db_module(monkeypatch):
@@ -690,3 +690,99 @@ async def test_call_with_flood_retry_gives_up_on_transient_error(fake_db):
         pytest.raises(OSError, match="disk failure"),
     ):
         await telegram_backup.call_with_flood_retry(broken_api, max_retries=3)
+
+
+@pytest.mark.asyncio
+async def test_call_with_flood_retry_handles_flood_premium_wait(fake_db):
+    """FloodPremiumWaitError must be handled by the flood-wait path, not transient."""
+    from src import telegram_backup
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    async def premium_limited():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise FloodPremiumWaitError(request=None, capture=8)
+        return "ok"
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    with (
+        patch.object(telegram_backup.asyncio, "sleep", record_sleep),
+        patch("src.telegram_backup.random.uniform", return_value=1.0),
+    ):
+        result = await telegram_backup.call_with_flood_retry(premium_limited)
+
+    assert result == "ok"
+    assert calls["n"] == 3
+    # Must use max(wait_seconds=8, backoff) + jitter=1.0 (flood-wait path),
+    # NOT backoff-only (transient path).  Retry 1 backoff=2, max(8,2)=8 → 9.0.
+    # Retry 2 backoff=4, max(8,4)=8 → 9.0.
+    assert sleeps == [9.0, 9.0]
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_handles_flood_premium_wait(caplog, fake_db):
+    """iter_messages_with_flood_retry must catch FloodPremiumWaitError."""
+    from src import telegram_backup
+
+    calls = {"n": 0}
+
+    async def iter_with_premium_flood(entity, min_id=0, reverse=True, **_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield SimpleNamespace(id=1)
+            raise FloodPremiumWaitError(request=None, capture=10)
+        assert min_id == 1
+        yield SimpleNamespace(id=2)
+
+    fake_client = SimpleNamespace(iter_messages=iter_with_premium_flood)
+    collected: list[int] = []
+
+    async def fast_sleep(_):
+        return None
+
+    with (
+        caplog.at_level(logging.WARNING, logger="src.telegram_backup"),
+        patch.object(telegram_backup.asyncio, "sleep", fast_sleep),
+    ):
+        async for msg in telegram_backup.iter_messages_with_flood_retry(fake_client, "chat", min_id=0, reverse=True):
+            collected.append(msg.id)
+
+    assert collected == [1, 2]
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_flood_premium_wait_not_treated_as_transient(fake_db):
+    """FloodPremiumWaitError must NOT be retried by the transient-error handler."""
+    from src import telegram_backup
+
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    async def premium_then_ok():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise FloodPremiumWaitError(request=None, capture=5)
+        return "done"
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    with (
+        patch.object(telegram_backup.asyncio, "sleep", record_sleep),
+        patch("src.telegram_backup.random.uniform", return_value=1.0),
+    ):
+        result = await telegram_backup.call_with_flood_retry(premium_then_ok)
+
+    assert result == "done"
+    # The flood-wait path uses max(wait_seconds, backoff) + jitter.
+    # Retry 1: max(5, 2) + 1.0 = 6.0.
+    # If transient handler caught it, it would be backoff-only: 2 + 1.0 = 3.0.
+    assert sleeps == [6.0], (
+        f"Expected flood-wait sleep [6.0], got {sleeps}; "
+        "FloodPremiumWaitError may be falling through to the transient handler"
+    )
