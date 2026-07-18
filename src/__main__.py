@@ -164,6 +164,25 @@ For more information, visit: https://github.com/GeiserX/Telegram-Archive
         help="Minimum gap size to investigate (overrides GAP_THRESHOLD env var)",
     )
 
+    # Clean media command
+    clean_media_parser = subparsers.add_parser(
+        "clean-media",
+        help="Find and remove orphan media blobs in _shared/",
+        description=(
+            "Scans the _shared/ dedup store for blobs not referenced by any "
+            "database record and reports reclaimable space. Use --delete to "
+            "actually remove orphans."
+        ),
+    )
+    clean_media_parser.add_argument(
+        "--delete", action="store_true", help="Actually delete orphan blobs (default is dry-run/report only)"
+    )
+    clean_media_parser.add_argument(
+        "--include-dangling",
+        action="store_true",
+        help="Also detect and remove dangling symlinks in per-chat directories",
+    )
+
     return parser
 
 
@@ -292,6 +311,51 @@ async def run_import(args) -> int:
         return 1
 
 
+async def run_clean_media(args) -> int:
+    """Run clean-media command."""
+    from .cleanup_media import clean_orphan_media
+    from .config import Config, setup_logging
+    from .db import close_database, get_adapter, init_database
+
+    try:
+        config = Config()
+        setup_logging(config)
+
+        await init_database()
+        db = await get_adapter()
+        try:
+            summary = await clean_orphan_media(
+                config.media_path,
+                db,
+                delete=args.delete,
+                include_dangling=args.include_dangling,
+            )
+        finally:
+            await close_database()
+
+        mode = "DELETE" if args.delete else "DRY RUN"
+        print(f"\n[{mode}] Orphan media cleanup:")
+        print(f"  Total blobs in _shared/:   {summary['total_blobs']}")
+        print(f"  Referenced by DB:          {summary['referenced_blobs']}")
+        print(f"  Orphans found:             {summary['orphan_blobs']}")
+        orphan_mb = summary["orphan_bytes"] / (1024 * 1024)
+        print(f"  Reclaimable space:         {orphan_mb:.1f} MB")
+        if args.delete:
+            freed_mb = summary["freed_bytes"] / (1024 * 1024)
+            print(f"  Deleted:                   {summary['deleted_blobs']} blobs ({freed_mb:.1f} MB freed)")
+            if summary["errors"]:
+                print(f"  Errors:                    {summary['errors']}")
+        if args.include_dangling:
+            print(f"  Dangling symlinks:         {summary.get('dangling_symlinks', 0)}")
+            if args.delete and summary.get("deleted_dangling", 0):
+                print(f"  Dangling removed:          {summary['deleted_dangling']}")
+
+        return 0
+    except Exception as e:
+        print(f"Clean-media failed: {e}", file=sys.stderr)
+        return 1
+
+
 def run_auth(args) -> int:
     """Run authentication setup."""
     from .setup_auth import main as auth_main
@@ -355,6 +419,8 @@ def main() -> int:
         return asyncio.run(run_import(args))
     elif args.command == "fill-gaps":
         return asyncio.run(run_fill_gaps_cmd(args))
+    elif args.command == "clean-media":
+        return asyncio.run(run_clean_media(args))
     else:
         parser.print_help()
         return 0
