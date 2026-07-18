@@ -886,6 +886,32 @@ class DatabaseAdapter:
             if len(rows) < batch_size:
                 return
 
+    async def iter_all_media_file_paths(self, batch_size: int = 5000):
+        """Yield batches of all non-null ``Media.file_path`` values.
+
+        Keyset-paginated on the primary key so memory stays bounded on large
+        archives. Used by the orphan media cleanup script to collect every
+        path the DB still references.
+        """
+        last_id: str | None = None
+        while True:
+            async with self.db_manager.async_session_factory() as session:
+                stmt = (
+                    select(Media.id, Media.file_path)
+                    .where(Media.file_path.isnot(None))
+                    .order_by(Media.id)
+                    .limit(batch_size)
+                )
+                if last_id is not None:
+                    stmt = stmt.where(Media.id > last_id)
+                rows = (await session.execute(stmt)).all()
+            if not rows:
+                return
+            yield [r[1] for r in rows]
+            last_id = rows[-1][0]
+            if len(rows) < batch_size:
+                return
+
     async def get_pending_media_downloads(self, max_media_size_bytes: int | None = None) -> list[dict[str, Any]]:
         """Get media records that failed to download and need retry.
 
