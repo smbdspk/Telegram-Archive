@@ -178,6 +178,11 @@ For more information, visit: https://github.com/GeiserX/Telegram-Archive
         "--delete", action="store_true", help="Actually delete orphan blobs (default is dry-run/report only)"
     )
     clean_media_parser.add_argument(
+        "--purge-skipped",
+        action="store_true",
+        help="Remove per-chat symlinks and DB records for SKIP_MEDIA_CHAT_IDS chats (no Telegram API needed)",
+    )
+    clean_media_parser.add_argument(
         "--include-dangling",
         action="store_true",
         help="Also detect and remove dangling symlinks in per-chat directories",
@@ -313,7 +318,7 @@ async def run_import(args) -> int:
 
 async def run_clean_media(args) -> int:
     """Run clean-media command."""
-    from .cleanup_media import clean_orphan_media
+    from .cleanup_media import clean_orphan_media, purge_skipped_chat_media
     from .config import Config, setup_logging
     from .db import close_database, get_adapter, init_database
 
@@ -324,6 +329,17 @@ async def run_clean_media(args) -> int:
         await init_database()
         db = await get_adapter()
         try:
+            # Phase 1: purge per-chat media for SKIP_MEDIA_CHAT_IDS chats
+            purge_summary = None
+            if args.purge_skipped and config.skip_media_chat_ids:
+                purge_summary = await purge_skipped_chat_media(
+                    config.media_path,
+                    db,
+                    config.skip_media_chat_ids,
+                    delete=args.delete,
+                )
+
+            # Phase 2: orphan blob scan
             summary = await clean_orphan_media(
                 config.media_path,
                 db,
@@ -334,6 +350,24 @@ async def run_clean_media(args) -> int:
             await close_database()
 
         mode = "DELETE" if args.delete else "DRY RUN"
+
+        # Print purge results
+        if purge_summary and purge_summary["media_records"] > 0:
+            print(f"\n[{mode}] Purge skipped chats (SKIP_MEDIA_CHAT_IDS):")
+            print(f"  Chats with media:          {purge_summary['chats_processed']}")
+            print(f"  Media DB records:          {purge_summary['media_records']}")
+            print(f"  Files (non-dedup):         {purge_summary['files_removed']}")
+            print(f"  Symlinks (dedup):          {purge_summary['symlinks_removed']}")
+            freed_mb = purge_summary["freed_bytes"] / (1024 * 1024)
+            print(f"  Direct space freed:        {freed_mb:.1f} MB")
+            if args.delete:
+                print(f"  DB records deleted:        {purge_summary['db_records_deleted']}")
+            if purge_summary["errors"]:
+                print(f"  Errors:                    {purge_summary['errors']}")
+        elif args.purge_skipped:
+            print(f"\n[{mode}] No media records found for SKIP_MEDIA_CHAT_IDS chats.")
+
+        # Print orphan scan results
         print(f"\n[{mode}] Orphan media cleanup:")
         print(f"  Total blobs in _shared/:   {summary['total_blobs']}")
         print(f"  Referenced by DB:          {summary['referenced_blobs']}")
