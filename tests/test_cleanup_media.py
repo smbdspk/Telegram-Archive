@@ -11,7 +11,9 @@ from src.cleanup_media import (
     _collect_shared_blobs,
     _delete_dangling_sync,
     _delete_orphans_sync,
+    _purge_chat_media_sync,
     clean_orphan_media,
+    purge_skipped_chat_media,
 )
 
 
@@ -551,3 +553,240 @@ class TestCleanOrphanMedia:
             # All empty shard dirs should be cleaned
             for bucket in ("aa", "bb", "cc"):
                 assert not os.path.exists(os.path.join(shared, bucket))
+
+
+class TestPurgeChatMediaSync(unittest.TestCase):
+    """Test _purge_chat_media_sync filesystem helper."""
+
+    def test_removes_real_files(self):
+        """Non-symlink files are deleted and bytes counted."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            f = os.path.join(chat_dir, "photo.jpg")
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 500)
+
+            records = [{"file_path": f}]
+            files, symlinks, freed, errors = _purge_chat_media_sync(records, media_path, 12345)
+
+            assert files == 1
+            assert symlinks == 0
+            assert freed == 500
+            assert errors == 0
+            assert not os.path.exists(f)
+            # Empty dir should be cleaned
+            assert not os.path.exists(chat_dir)
+
+    def test_removes_symlinks(self):
+        """Symlinks are removed without touching the target."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            shared = os.path.join(media_path, "_shared", "ab")
+            os.makedirs(shared)
+            blob = os.path.join(shared, "blob.jpg")
+            with open(blob, "wb") as fh:
+                fh.write(b"x" * 100)
+
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            link = os.path.join(chat_dir, "blob.jpg")
+            try:
+                os.symlink(blob, link)
+            except OSError:
+                pytest.skip("symlinks not supported")
+
+            records = [{"file_path": link}]
+            files, symlinks, freed, errors = _purge_chat_media_sync(records, media_path, 12345)
+
+            assert files == 0
+            assert symlinks == 1
+            assert freed == 0
+            assert errors == 0
+            assert not os.path.lexists(link)
+            # Blob should still exist
+            assert os.path.exists(blob)
+
+    def test_skips_missing_files(self):
+        """Records with missing file_path are skipped."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            records = [
+                {"file_path": None},
+                {"file_path": "/nonexistent/file.jpg"},
+                {},
+            ]
+            files, symlinks, freed, errors = _purge_chat_media_sync(records, td, 12345)
+            assert files == 0
+            assert symlinks == 0
+
+    def test_keeps_nonempty_chat_dir(self):
+        """Chat directory is NOT removed if other files remain."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            target = os.path.join(chat_dir, "delete_me.jpg")
+            keeper = os.path.join(chat_dir, "keep_me.jpg")
+            with open(target, "wb") as fh:
+                fh.write(b"x")
+            with open(keeper, "wb") as fh:
+                fh.write(b"y")
+
+            records = [{"file_path": target}]
+            _purge_chat_media_sync(records, media_path, 12345)
+
+            assert os.path.exists(chat_dir)
+            assert os.path.exists(keeper)
+
+
+class TestPurgeSkippedChatMedia:
+    """Integration tests for purge_skipped_chat_media."""
+
+    def _make_mock_db(self, chat_media: dict[int, list[dict]]) -> MagicMock:
+        """Create a mock DB with media records keyed by chat_id."""
+        db = MagicMock()
+
+        async def _get_media(chat_id):
+            return chat_media.get(chat_id, [])
+
+        async def _delete_media(chat_id):
+            return len(chat_media.get(chat_id, []))
+
+        async def _iter_paths(batch_size=5000):
+            # Return all file_paths across all chats
+            all_paths = []
+            for records in chat_media.values():
+                for r in records:
+                    if r.get("file_path"):
+                        all_paths.append(r["file_path"])
+            if all_paths:
+                yield all_paths
+
+        db.get_media_for_chat = _get_media
+        db.delete_media_for_chat = _delete_media
+        db.iter_all_media_file_paths = _iter_paths
+        return db
+
+    async def test_dry_run_reports_only(self):
+        """Dry-run reports what would be deleted but doesn't touch anything."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            f = os.path.join(chat_dir, "photo.jpg")
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 500)
+
+            db = self._make_mock_db({12345: [{"file_path": f}]})
+            result = await purge_skipped_chat_media(media_path, db, {12345}, delete=False)
+
+            assert result["chats_processed"] == 1
+            assert result["media_records"] == 1
+            assert result["files_removed"] == 1
+            assert result["db_records_deleted"] == 0
+            # File should still exist
+            assert os.path.exists(f)
+
+    async def test_delete_removes_files_and_db_records(self):
+        """Delete mode removes files and DB records."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            f = os.path.join(chat_dir, "photo.jpg")
+            with open(f, "wb") as fh:
+                fh.write(b"x" * 500)
+
+            db = self._make_mock_db({12345: [{"file_path": f}]})
+            result = await purge_skipped_chat_media(media_path, db, {12345}, delete=True)
+
+            assert result["chats_processed"] == 1
+            assert result["files_removed"] == 1
+            assert result["freed_bytes"] == 500
+            assert result["db_records_deleted"] == 1
+            assert not os.path.exists(f)
+
+    async def test_skips_chats_with_no_media(self):
+        """Chats with no media records are skipped."""
+        db = self._make_mock_db({})
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            result = await purge_skipped_chat_media(td, db, {12345, 67890}, delete=True)
+
+            assert result["chats_processed"] == 0
+            assert result["media_records"] == 0
+
+    async def test_multiple_chats(self):
+        """Multiple chats are processed."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            chat_media = {}
+            for chat_id in (111, 222):
+                chat_dir = os.path.join(media_path, str(chat_id))
+                os.makedirs(chat_dir)
+                f = os.path.join(chat_dir, "file.jpg")
+                with open(f, "wb") as fh:
+                    fh.write(b"x" * 100)
+                chat_media[chat_id] = [{"file_path": f}]
+
+            db = self._make_mock_db(chat_media)
+            result = await purge_skipped_chat_media(media_path, db, {111, 222}, delete=True)
+
+            assert result["chats_processed"] == 2
+            assert result["files_removed"] == 2
+            assert result["freed_bytes"] == 200
+
+    async def test_purge_then_orphan_scan(self):
+        """Purge + orphan scan together catches newly-orphaned blobs."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            shared = os.path.join(media_path, "_shared", "ab")
+            os.makedirs(shared)
+            blob = os.path.join(shared, "blob.jpg")
+            with open(blob, "wb") as fh:
+                fh.write(b"x" * 1000)
+
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            link = os.path.join(chat_dir, "blob.jpg")
+            try:
+                os.symlink(blob, link)
+            except OSError:
+                pytest.skip("symlinks not supported")
+
+            # DB references the symlink
+            chat_media = {12345: [{"file_path": link}]}
+            db = self._make_mock_db(chat_media)
+
+            # Phase 1: purge removes symlink + DB records
+            purge_result = await purge_skipped_chat_media(media_path, db, {12345}, delete=True)
+            assert purge_result["symlinks_removed"] == 1
+            assert not os.path.lexists(link)
+
+            # After purge, DB has no references → update mock
+            db_after = self._make_mock_db({})
+
+            # Phase 2: orphan scan finds the now-unreferenced blob
+            orphan_result = await clean_orphan_media(media_path, db_after, delete=True)
+            assert orphan_result["orphan_blobs"] == 1
+            assert orphan_result["deleted_blobs"] == 1
+            assert orphan_result["freed_bytes"] == 1000
+            assert not os.path.exists(blob)

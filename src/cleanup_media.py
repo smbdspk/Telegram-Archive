@@ -18,6 +18,9 @@ Usage (via CLI)::
     # Actually delete orphans
     python -m src clean-media --delete
 
+    # Purge per-chat media for SKIP_MEDIA_CHAT_IDS chats, then clean orphans
+    python -m src clean-media --purge-skipped --delete
+
     # Also clean up dangling symlinks in per-chat dirs
     python -m src clean-media --delete --include-dangling
 """
@@ -26,7 +29,7 @@ import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
-from typing import Protocol
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +40,10 @@ class _CleanupDB(Protocol):
     """Narrow DB surface the cleanup depends on."""
 
     def iter_all_media_file_paths(self, batch_size: int = ...) -> AsyncIterator[list[str]]: ...
+
+    async def get_media_for_chat(self, chat_id: int) -> list[dict[str, Any]]: ...
+
+    async def delete_media_for_chat(self, chat_id: int) -> int: ...
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +169,138 @@ def _delete_dangling_sync(dangling_paths: list[str]) -> tuple[int, int]:
         except OSError:
             errors += 1
     return deleted, errors
+
+
+def _purge_chat_media_sync(
+    media_records: list[dict[str, Any]],
+    media_path: str,
+    chat_id: int,
+) -> tuple[int, int, int, int]:
+    """Remove per-chat symlinks/files for a single chat.
+
+    Returns ``(deleted_files, deleted_symlinks, freed_bytes, errors)``.
+    Only removes files in the per-chat directory — never touches
+    ``_shared/`` blobs directly (the orphan scan handles those).
+    """
+    deleted_files = 0
+    deleted_symlinks = 0
+    freed_bytes = 0
+    errors = 0
+
+    for record in media_records:
+        file_path = record.get("file_path")
+        if not file_path or not os.path.exists(file_path):
+            continue
+        try:
+            if os.path.islink(file_path):
+                os.unlink(file_path)
+                deleted_symlinks += 1
+            else:
+                freed_bytes += os.path.getsize(file_path)
+                os.remove(file_path)
+                deleted_files += 1
+        except FileNotFoundError:
+            pass
+        except OSError:
+            errors += 1
+
+    # Clean up empty chat media directory
+    chat_media_dir = os.path.join(media_path, str(chat_id))
+    if os.path.isdir(chat_media_dir):
+        try:
+            if not os.listdir(chat_media_dir):
+                os.rmdir(chat_media_dir)
+        except OSError:
+            pass
+
+    return deleted_files, deleted_symlinks, freed_bytes, errors
+
+
+async def purge_skipped_chat_media(
+    media_path: str,
+    db: _CleanupDB,
+    skip_chat_ids: set[int],
+    *,
+    delete: bool = False,
+) -> dict:
+    """Remove per-chat symlinks + DB records for ``SKIP_MEDIA_CHAT_IDS`` chats.
+
+    This is the per-chat cleanup that ``_cleanup_existing_media()`` does inside
+    the backup loop, but callable standalone — no Telegram API needed.
+
+    After this runs, any blobs in ``_shared/`` that lost their last reference
+    will be caught by the orphan scan (``clean_orphan_media``).
+
+    Args:
+        media_path: Root media directory.
+        db: Database adapter.
+        skip_chat_ids: Chat IDs to purge media for.
+        delete: If True, actually delete. Otherwise report only.
+
+    Returns:
+        Summary dict with per-chat and aggregate counts.
+    """
+    total_records = 0
+    total_files = 0
+    total_symlinks = 0
+    total_freed = 0
+    total_errors = 0
+    total_db_deleted = 0
+    chats_processed = 0
+
+    for chat_id in sorted(skip_chat_ids):
+        media_records = await db.get_media_for_chat(chat_id)
+        if not media_records:
+            continue
+
+        total_records += len(media_records)
+        chats_processed += 1
+
+        if not delete:
+            # Dry-run: count what would be deleted
+            for record in media_records:
+                file_path = record.get("file_path")
+                if file_path and os.path.exists(file_path):
+                    if os.path.islink(file_path):
+                        total_symlinks += 1
+                    else:
+                        total_files += 1
+                        try:
+                            total_freed += os.path.getsize(file_path)
+                        except OSError:
+                            pass
+            continue
+
+        # Delete mode: remove files, then DB records
+        files, symlinks, freed, errs = await asyncio.to_thread(
+            _purge_chat_media_sync, media_records, media_path, chat_id
+        )
+        total_files += files
+        total_symlinks += symlinks
+        total_freed += freed
+        total_errors += errs
+
+        db_deleted = await db.delete_media_for_chat(chat_id)
+        total_db_deleted += db_deleted
+
+    if total_records:
+        logger.info(
+            "Purge skipped chats: %d chats, %d records, %d files, %d symlinks",
+            chats_processed,
+            total_records,
+            total_files,
+            total_symlinks,
+        )
+
+    return {
+        "chats_processed": chats_processed,
+        "media_records": total_records,
+        "files_removed": total_files,
+        "symlinks_removed": total_symlinks,
+        "freed_bytes": total_freed,
+        "db_records_deleted": total_db_deleted,
+        "errors": total_errors,
+    }
 
 
 # ---------------------------------------------------------------------------
