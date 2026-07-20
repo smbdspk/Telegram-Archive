@@ -238,7 +238,10 @@ async def purge_skipped_chat_media(
         delete: If True, actually delete. Otherwise report only.
 
     Returns:
-        Summary dict with per-chat and aggregate counts.
+        Summary dict with per-chat and aggregate counts.  Includes a
+        ``purged_realpaths`` set of resolved blob paths whose references
+        were (or would be) removed — used by the orphan scan to simulate
+        the post-purge state in dry-run mode.
     """
     total_records = 0
     total_files = 0
@@ -247,6 +250,7 @@ async def purge_skipped_chat_media(
     total_errors = 0
     total_db_deleted = 0
     chats_processed = 0
+    purged_realpaths: set[str] = set()
 
     for chat_id in sorted(skip_chat_ids):
         media_records = await db.get_media_for_chat(chat_id)
@@ -255,6 +259,15 @@ async def purge_skipped_chat_media(
 
         total_records += len(media_records)
         chats_processed += 1
+
+        # Collect resolved blob paths for all records (both modes)
+        for record in media_records:
+            file_path = record.get("file_path")
+            if file_path:
+                try:
+                    purged_realpaths.add(os.path.realpath(file_path))
+                except OSError, ValueError:
+                    pass
 
         if not delete:
             # Dry-run: count what would be deleted
@@ -300,6 +313,7 @@ async def purge_skipped_chat_media(
         "freed_bytes": total_freed,
         "db_records_deleted": total_db_deleted,
         "errors": total_errors,
+        "purged_realpaths": purged_realpaths,
     }
 
 
@@ -314,6 +328,7 @@ async def clean_orphan_media(
     *,
     delete: bool = False,
     include_dangling: bool = False,
+    exclude_realpaths: set[str] | None = None,
 ) -> dict:
     """Detect (and optionally remove) orphan media blobs.
 
@@ -323,6 +338,10 @@ async def clean_orphan_media(
         delete: If True, actually remove orphans. Otherwise report only.
         include_dangling: If True, also detect/remove dangling symlinks
             in per-chat directories.
+        exclude_realpaths: Resolved blob paths to treat as "unreferenced"
+            even if the DB still lists them.  Used by dry-run when
+            ``--purge-skipped`` simulates removing references without
+            actually deleting DB records.
 
     Returns:
         Summary dict with counts and sizes.
@@ -357,6 +376,10 @@ async def clean_orphan_media(
                 referenced_realpaths.add(real)
             except OSError, ValueError:
                 pass
+
+    # Simulate post-purge state: remove paths that purge would delete
+    if exclude_realpaths:
+        referenced_realpaths -= exclude_realpaths
 
     logger.info("DB references %d unique real paths", len(referenced_realpaths))
 

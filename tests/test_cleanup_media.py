@@ -779,6 +779,7 @@ class TestPurgeSkippedChatMedia:
             # Phase 1: purge removes symlink + DB records
             purge_result = await purge_skipped_chat_media(media_path, db, {12345}, delete=True)
             assert purge_result["symlinks_removed"] == 1
+            assert "purged_realpaths" in purge_result
             assert not os.path.lexists(link)
 
             # After purge, DB has no references → update mock
@@ -790,3 +791,108 @@ class TestPurgeSkippedChatMedia:
             assert orphan_result["deleted_blobs"] == 1
             assert orphan_result["freed_bytes"] == 1000
             assert not os.path.exists(blob)
+
+    async def test_purged_realpaths_returned_in_dry_run(self):
+        """Dry-run purge returns purged_realpaths for orphan scan simulation."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            shared = os.path.join(media_path, "_shared", "ab")
+            os.makedirs(shared)
+            blob = os.path.join(shared, "blob.jpg")
+            with open(blob, "wb") as fh:
+                fh.write(b"x" * 100)
+
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            link = os.path.join(chat_dir, "blob.jpg")
+            try:
+                os.symlink(blob, link)
+            except OSError:
+                pytest.skip("symlinks not supported")
+
+            db = self._make_mock_db({12345: [{"file_path": link}]})
+            result = await purge_skipped_chat_media(media_path, db, {12345}, delete=False)
+
+            assert "purged_realpaths" in result
+            assert os.path.realpath(blob) in result["purged_realpaths"]
+
+    async def test_dryrun_orphan_scan_with_exclude(self):
+        """Dry-run orphan scan with exclude_realpaths shows accurate counts."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            shared = os.path.join(media_path, "_shared", "ab")
+            os.makedirs(shared)
+            blob = os.path.join(shared, "blob.jpg")
+            with open(blob, "wb") as fh:
+                fh.write(b"x" * 500)
+
+            chat_dir = os.path.join(media_path, "12345")
+            os.makedirs(chat_dir)
+            link = os.path.join(chat_dir, "blob.jpg")
+            try:
+                os.symlink(blob, link)
+            except OSError:
+                pytest.skip("symlinks not supported")
+
+            # DB still references the symlink (dry-run didn't delete)
+            db = self._make_mock_db({12345: [{"file_path": link}]})
+
+            # Without exclude: no orphans
+            result_no_exclude = await clean_orphan_media(media_path, db)
+            assert result_no_exclude["orphan_blobs"] == 0
+
+            # With exclude: blob is orphaned
+            exclude = {os.path.realpath(blob)}
+            result_with_exclude = await clean_orphan_media(media_path, db, exclude_realpaths=exclude)
+            assert result_with_exclude["orphan_blobs"] == 1
+            assert result_with_exclude["orphan_bytes"] == 500
+            # Dry-run: nothing deleted
+            assert result_with_exclude["deleted_blobs"] == 0
+            # Blob still exists
+            assert os.path.exists(blob)
+
+    async def test_exclude_realpaths_shared_blob_safety(self):
+        """Shared blob is NOT orphaned if another chat still references it."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            media_path = td
+            shared = os.path.join(media_path, "_shared", "ab")
+            os.makedirs(shared)
+            blob = os.path.join(shared, "shared_blob.jpg")
+            with open(blob, "wb") as fh:
+                fh.write(b"x" * 500)
+
+            # Two chats reference the same blob
+            for chat_id in (12345, 67890):
+                chat_dir = os.path.join(media_path, str(chat_id))
+                os.makedirs(chat_dir)
+                link = os.path.join(chat_dir, "shared_blob.jpg")
+                try:
+                    os.symlink(blob, link)
+                except OSError:
+                    pytest.skip("symlinks not supported")
+
+            link_skipped = os.path.join(media_path, "12345", "shared_blob.jpg")
+            link_kept = os.path.join(media_path, "67890", "shared_blob.jpg")
+
+            # DB has both chats' references
+            db = self._make_mock_db(
+                {
+                    12345: [{"file_path": link_skipped}],
+                    67890: [{"file_path": link_kept}],
+                }
+            )
+
+            # Only purging chat 12345 — chat 67890 still references the blob
+            purge_result = await purge_skipped_chat_media(media_path, db, {12345}, delete=False)
+            exclude = purge_result["purged_realpaths"]
+
+            # Orphan scan with exclude: blob should NOT be orphaned
+            # because chat 67890 still references it
+            result = await clean_orphan_media(media_path, db, exclude_realpaths=exclude)
+            assert result["orphan_blobs"] == 0
