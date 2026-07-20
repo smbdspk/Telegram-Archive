@@ -340,11 +340,15 @@ async def run_clean_media(args) -> int:
                 )
 
             # Phase 2: orphan blob scan
+            # In dry-run, pass purged_realpaths so the orphan scan simulates
+            # the post-purge state (those DB references would be gone).
+            exclude = purge_summary.get("purged_realpaths") if purge_summary else None
             summary = await clean_orphan_media(
                 config.media_path,
                 db,
                 delete=args.delete,
                 include_dangling=args.include_dangling,
+                exclude_realpaths=exclude,
             )
         finally:
             await close_database()
