@@ -23,9 +23,11 @@ Design constraints (issue #183, all enforced here):
    ``os.pwrite`` at its exact request offset (no shared seek pointer), and
    before the file is accepted we assert the written byte ranges cover
    ``[0, file_size)`` exactly once, with no gaps or overlaps.
-5. **Transactional.** Any chunk failure cancels siblings, closes every sender,
-   deletes the partial output, and re-raises the original exception type so the
-   caller's retry / ``FileReferenceExpired`` refresh logic is unchanged.
+5. **Transactional & resumable.** Any chunk failure cancels siblings, closes
+   every sender, preserves completed chunk offsets for in-place resume, and
+   re-raises the original exception type so the caller's retry /
+   ``FileReferenceExpired`` refresh logic is unchanged (and cleans up the
+   partial output if all retries are exhausted).
 6. **Bounded memory.** Chunks stream straight to disk; peak resident bytes are
    roughly ``connections * part_size`` (default 4 * 512 KiB = 2 MiB).
 """
@@ -154,6 +156,11 @@ class ParallelDownloader:
         # lifetime: exportAuthorization is flood-limited and paying it once
         # per FILE was the dominant spend of the caller's flood budget.
         self._dc_auth_keys: dict = {}
+        self._completed_offsets: dict[str, set[int]] = {}
+
+    def get_completed_count(self, dest_path: str) -> int:
+        """Return the number of completed chunks for ``dest_path``."""
+        return len(self._completed_offsets.get(dest_path, set()))
 
     async def download_media(self, message, file) -> str:
         """Download ``message``'s media to path ``file`` and return ``file``.
@@ -185,55 +192,82 @@ class ParallelDownloader:
         return file
 
     async def _download_location(self, location, dc_id, file_size: int, dest_path: str) -> None:
-        offsets = list(range(0, file_size, self._part_size))
-        queue: asyncio.Queue[int] = asyncio.Queue()
-        for off in offsets:
-            queue.put_nowait(off)
+        completed = self._completed_offsets.setdefault(dest_path, set())
 
-        written: list[tuple[int, int]] = []
         senders: list[MTProtoSender] = []
-        # O_NOFOLLOW (where available) refuses to follow a pre-planted symlink at
-        # dest_path, so a shared/world-writable media dir can't redirect our write.
-        open_flags = os.O_RDWR | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(dest_path, open_flags, 0o644)
+        fd = -1
         try:
-            os.ftruncate(fd, file_size)
-            n = min(self._connections, len(offsets)) or 1
-            senders = await self._build_senders(dc_id, n)
+            exists = os.path.exists(dest_path)
+            if not exists:
+                completed.clear()
 
-            workers = [
-                asyncio.create_task(self._worker(sender, location, file_size, queue, fd, written)) for sender in senders
-            ]
-            try:
-                await asyncio.gather(*workers)
-            except BaseException:
-                # Transactional cancel: stop every sibling before propagating so
-                # no worker keeps issuing requests after the transfer has failed.
-                for w in workers:
-                    w.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-                raise
+            # O_NOFOLLOW (where available) refuses to follow a pre-planted symlink at
+            # dest_path, so a shared/world-writable media dir can't redirect our write.
+            # Include O_BINARY on Windows to prevent translation of \n to \r\n.
+            # Omit O_TRUNC to allow resuming.
+            open_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(dest_path, open_flags, 0o644)
+
+            current_size = os.fstat(fd).st_size
+            if not exists or current_size != file_size:
+                completed.clear()
+                os.ftruncate(fd, file_size)
+
+            offsets = list(range(0, file_size, self._part_size))
+            if completed and not completed.issubset(set(offsets)):
+                completed.clear()
+
+            # Populate initial written list with already completed offsets
+            written: list[tuple[int, int]] = []
+            for off in completed:
+                chunk_len = min(self._part_size, file_size - off)
+                written.append((off, chunk_len))
+
+            # Only queue offsets that have not been completed yet
+            queue: asyncio.Queue[int] = asyncio.Queue()
+            pending_offsets = [off for off in offsets if off not in completed]
+            for off in pending_offsets:
+                queue.put_nowait(off)
+
+            if pending_offsets:
+                n = min(self._connections, len(pending_offsets))
+                senders = await self._build_senders(dc_id, n)
+
+                workers = [
+                    asyncio.create_task(self._worker(sender, location, file_size, queue, fd, written, completed))
+                    for sender in senders
+                ]
+                try:
+                    await asyncio.gather(*workers)
+                except BaseException:
+                    # Transactional cancel: stop every sibling before propagating so
+                    # no worker keeps issuing requests after the transfer has failed.
+                    for w in workers:
+                        w.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    raise
 
             _verify_coverage(written, file_size)
             os.fsync(fd)
+            # Success! Clear completed tracking for this path.
+            self._completed_offsets.pop(dest_path, None)
         except BaseException:
-            try:
-                os.close(fd)
-            except OSError:
-                # Closing the fd must never mask the original chunk failure.
-                pass
-            fd = -1
-            try:
-                os.remove(dest_path)
-            except OSError:
-                pass
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    # Closing the fd must never mask the original chunk failure.
+                    pass
+                fd = -1
+            # DO NOT delete the file on exceptions here, so we can resume it.
+            # The outer backup layer is responsible for cleanup if the download fully fails.
             raise
         finally:
             if fd != -1:
                 os.close(fd)
             await self._close_senders(senders)
 
-    async def _worker(self, sender, location, file_size, queue, fd, written) -> None:
+    async def _worker(self, sender, location, file_size, queue, fd, written, completed) -> None:
         while True:
             try:
                 offset = queue.get_nowait()
@@ -272,6 +306,7 @@ class ParallelDownloader:
                 )
             _pwrite_all(fd, data, offset)
             written.append((offset, len(data)))
+            completed.add(offset)  # Track progress in real-time
 
     async def _build_senders(self, dc_id, n: int) -> list[MTProtoSender]:
         """Create ``n`` connected senders to ``dc_id`` sharing one auth key.
@@ -294,7 +329,7 @@ class ParallelDownloader:
                 try:
                     senders.extend(await self._connect_many(dc_id, cached_key, n))
                     return senders
-                except ParallelDownloadUnavailable, FloodWaitError, FileReferenceExpiredError:
+                except ParallelDownloadUnavailable, FloodWaitError, FloodPremiumWaitError, FileReferenceExpiredError:
                     raise
                 except Exception:
                     # The cached key went stale: drop it and fall through to a
@@ -334,7 +369,7 @@ class ParallelDownloader:
             # shutdown) otherwise skipped this cleanup and leaked every sender
             # connected so far — `first` included.
             await self._close_senders(senders)
-            if isinstance(exc, (FloodWaitError, FileReferenceExpiredError)):
+            if isinstance(exc, (FloodWaitError, FloodPremiumWaitError, FileReferenceExpiredError)):
                 # Surface flood (single budget) and stale-reference (refresh
                 # loop) unchanged so the caller's existing handling governs
                 # them, rather than masking them as a generic fallback.
@@ -366,7 +401,44 @@ class ParallelDownloader:
     async def _connect_sender(self, dc_id, auth_key) -> MTProtoSender:
         client = self._client
         dc = await client._get_dc(dc_id)
-        sender = MTProtoSender(auth_key, loggers=client._log)
+
+        # Inherit connection settings from the parent client where available
+        sender = MTProtoSender(
+            auth_key,
+            loggers=client._log,
+            retries=getattr(client, "_connection_retries", 5),
+            delay=getattr(client, "_retry_delay", 1),
+            auto_reconnect=getattr(client, "_auto_reconnect", True),
+            connect_timeout=getattr(client, "_timeout", 10),
+        )
+
+        # Telethon race condition workaround (issue #183 / parallel download drop):
+        # If the sender drops connection, recv_loop queues a background _reconnect task.
+        # If we concurrently call sender.disconnect() (e.g. aborting the transfer due to an
+        # error), Telethon sets sender._connection = None. The background task then wakes up,
+        # calls await sender._connection.connect(), and crashes loudly with AttributeError.
+        # We patch _disconnect to leave a safe dummy connection in place instead of None.
+        original_disconnect = sender._disconnect
+
+        class DummyConnection:
+            async def disconnect(self):
+                pass
+
+            async def connect(self, timeout=None):
+                raise asyncio.CancelledError("Sender disconnected during reconnect")
+
+            def send(self, *args, **kwargs):
+                pass
+
+            async def recv(self, *args, **kwargs):
+                raise asyncio.CancelledError()
+
+        async def safe_disconnect(error=None):
+            await original_disconnect(error=error)
+            sender._connection = DummyConnection()
+
+        sender._disconnect = safe_disconnect
+
         await sender.connect(
             client._connection(
                 dc.ip_address,

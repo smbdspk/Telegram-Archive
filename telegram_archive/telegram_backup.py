@@ -391,11 +391,42 @@ async def call_with_flood_retry(
     ``client`` overrides the client this helper reconnects between transient
     retries; by default it is inferred from ``coro_fn`` (see ``_retry_client``).
     """
+    progress_fn = kwargs.pop("progress_fn", None)
+    backup_inst = getattr(coro_fn, "__self__", None)
+    dest_path = None
+    if backup_inst and hasattr(backup_inst, "_parallel_downloader") and len(args) > 1 and isinstance(args[1], str):
+        dest_path = args[1]
+
+    def _get_progress() -> int:
+        if progress_fn:
+            return progress_fn()
+        if dest_path and backup_inst and getattr(backup_inst, "_parallel_downloader", None):
+            downloader = backup_inst._parallel_downloader
+            if downloader:
+                if hasattr(downloader, "get_completed_count"):
+                    return downloader.get_completed_count(dest_path)
+                if hasattr(downloader, "_completed_offsets"):
+                    return len(downloader._completed_offsets.get(dest_path, set()))
+        return 0
+
+    initial_progress = _get_progress()
+
     retries = 0
     while True:
         try:
             return await coro_fn(*args, **kwargs)
         except (FloodWaitError, FloodPremiumWaitError) as e:
+            current_progress = _get_progress()
+
+            if current_progress > initial_progress:
+                logger.info(
+                    "FloodWait: progress was made during attempt (downloaded %d -> %d chunks), resetting retry counter",
+                    initial_progress,
+                    current_progress,
+                )
+                retries = 0
+                initial_progress = current_progress
+
             retries += 1
             if retries > max_retries:
                 logger.error(
@@ -457,6 +488,16 @@ async def call_with_flood_retry(
                 # Caller handles this error itself (e.g. refresh the message and
                 # retry), so don't burn this retry budget on it here.
                 raise exc
+
+            current_progress = _get_progress()
+            if current_progress > initial_progress:
+                logger.info(
+                    "Transient Error: progress was made during attempt (downloaded %d -> %d chunks), resetting retry counter",
+                    initial_progress,
+                    current_progress,
+                )
+                retries = 0
+                initial_progress = current_progress
 
             retries += 1
             if retries > max_retries:
@@ -4516,10 +4557,18 @@ class TelegramBackup:
         timeout = getattr(self.config, "download_timeout_seconds", 3600)
         timeout_val = timeout if isinstance(timeout, int) and timeout > 0 else None
         last = MEDIA_REFRESH_MAX_ATTEMPTS - 1
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         try:
             for attempt in range(MEDIA_REFRESH_MAX_ATTEMPTS):
-                # Start each attempt clean so a prior partial never corrupts it.
-                if os.path.exists(tmp_path):
+                # Start each attempt clean unless ParallelDownloader has resumable chunk progress for tmp_path.
+                downloader = getattr(self, "_parallel_downloader", None)
+                has_parallel_progress = bool(
+                    downloader
+                    and hasattr(downloader, "get_completed_count")
+                    and downloader.get_completed_count(tmp_path) > 0
+                )
+                if not has_parallel_progress and os.path.exists(tmp_path):
                     os.remove(tmp_path)
                 try:
                     landed = await call_with_flood_retry(
@@ -4529,12 +4578,30 @@ class TelegramBackup:
                         file_size,
                         timeout_val,
                         non_retryable=_is_non_retryable_media_op,
+                        progress_fn=lambda: (
+                            self._parallel_downloader.get_completed_count(tmp_path)
+                            if getattr(self, "_parallel_downloader", None)
+                            and hasattr(self._parallel_downloader, "get_completed_count")
+                            else 0
+                        ),
                     )
                     check_complete_download(
                         landed if isinstance(landed, str) else tmp_path, declared_document_size(message)
                     )
                     return landed
                 except ShortDownloadError:
+                    downloader = getattr(self, "_parallel_downloader", None)
+                    if (
+                        downloader
+                        and hasattr(downloader, "_completed_offsets")
+                        and isinstance(downloader._completed_offsets, dict)
+                    ):
+                        downloader._completed_offsets.pop(tmp_path, None)
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
                     if attempt >= last:
                         logger.warning(
                             "Media download stopped early on all %d attempt(s); leaving it for a future backup run",
@@ -4614,6 +4681,14 @@ class TelegramBackup:
                 except OSError:
                     pass
             raise
+        finally:
+            downloader = getattr(self, "_parallel_downloader", None)
+            if (
+                downloader
+                and hasattr(downloader, "_completed_offsets")
+                and isinstance(downloader._completed_offsets, dict)
+            ):
+                downloader._completed_offsets.pop(tmp_path, None)
 
     async def _keep_replaced_media(self, message: Message, chat_id: int, source: str) -> bool:
         """True when an edit replaced this message's photo or file since it was archived.
@@ -5154,6 +5229,15 @@ class TelegramBackup:
                 try:
                     return await self._parallel_downloader.download_media(message, tmp_path)
                 except ParallelDownloadUnavailable as exc:
+                    if hasattr(self._parallel_downloader, "_completed_offsets") and isinstance(
+                        self._parallel_downloader._completed_offsets, dict
+                    ):
+                        self._parallel_downloader._completed_offsets.pop(tmp_path, None)
+                    if isinstance(tmp_path, str) and os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
                     logger.info(
                         "Parallel download not applicable (%s); falling back to single-stream", describe_exception(exc)
                     )

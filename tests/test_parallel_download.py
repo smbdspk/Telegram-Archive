@@ -14,6 +14,19 @@ import logging
 import os
 import tempfile
 import unittest
+
+# Shim os.pwrite on Windows/platforms lacking it for test suite execution
+if not hasattr(os, "pwrite"):
+
+    def fake_pwrite(fd: int, data: bytes, offset: int) -> int:
+        curr = os.lseek(fd, 0, os.SEEK_CUR)
+        try:
+            os.lseek(fd, offset, os.SEEK_SET)
+            return os.write(fd, data)
+        finally:
+            os.lseek(fd, curr, os.SEEK_SET)
+
+    os.pwrite = fake_pwrite  # type: ignore
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -469,8 +482,8 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         with self.assertRaises(FloodWaitError):
             await dl.download_media(_make_message(len(blob)), dest)
-        # Transactional: partial output removed, all senders closed.
-        self.assertFalse(os.path.exists(dest))
+        # Resuming support: partial output is preserved, all senders closed.
+        self.assertTrue(os.path.exists(dest))
         self.assertTrue(all(s.disconnected for s in client.created_senders))
 
     async def test_file_reference_expired_propagates(self) -> None:
@@ -482,12 +495,12 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         with self.assertRaises(FileReferenceExpiredError):
             await dl.download_media(_make_message(len(blob)), dest)
-        self.assertFalse(os.path.exists(dest))
+        self.assertTrue(os.path.exists(dest))
 
     async def test_file_reference_expired_mid_transfer_propagates(self) -> None:
         # A stale reference can surface on a later chunk, not just the first one.
         # It must still propagate unchanged (so the caller refreshes), cancel
-        # siblings, and remove the partial output.
+        # siblings, and preserve the partial output.
         blob = os.urandom(524288 * 4)
         client = FakeClient(blob, fail_at_offset=524288 * 2, fail_exc=FileReferenceExpiredError(request=None))
         self._patch_sender(client)
@@ -496,12 +509,12 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         with self.assertRaises(FileReferenceExpiredError):
             await dl.download_media(_make_message(len(blob)), dest)
-        self.assertFalse(os.path.exists(dest))
+        self.assertTrue(os.path.exists(dest))
         self.assertTrue(all(s.disconnected for s in client.created_senders))
 
     async def test_blob_shorter_than_declared_size_aborts(self) -> None:
         # If the server returns fewer bytes than the declared size (so a tail
-        # chunk comes back empty/short), the guard fires and the partial is gone.
+        # chunk comes back empty/short), the guard fires and the partial is preserved.
         declared = 524288 * 3
         client = FakeClient(os.urandom(524288 * 2))  # blob is a full part short
         self._patch_sender(client)
@@ -510,7 +523,7 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         with self.assertRaises(ParallelDownloadUnavailable):
             await dl.download_media(_make_message(declared), dest)
-        self.assertFalse(os.path.exists(dest))
+        self.assertTrue(os.path.exists(dest))
 
     async def test_short_chunk_is_detected_and_aborts(self) -> None:
         blob = os.urandom(524288 * 2)
@@ -522,7 +535,7 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         with self.assertRaises(ParallelDownloadUnavailable):
             await dl.download_media(_make_message(len(blob)), dest)
-        self.assertFalse(os.path.exists(dest))
+        self.assertTrue(os.path.exists(dest))
 
     async def test_concurrent_workers_do_not_corrupt_offsets(self) -> None:
         # Many small parts across several senders; the only way the output equals
@@ -536,26 +549,6 @@ class TestFailureModes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTest
 
         await dl.download_media(_make_message(len(blob)), dest)
         self.assertEqual(_read(dest), blob)
-
-    async def test_cleanup_tolerates_missing_partial_file(self) -> None:
-        # A chunk failure triggers cleanup; if the partial file is already gone,
-        # os.remove's OSError must be swallowed and the original error re-raised.
-        blob = os.urandom(524288 * 2)
-        client = FakeClient(blob, short_at_offset=0)
-        self._patch_sender(client)
-        dl = ParallelDownloader(client, connections=2, part_size=524288)
-        dest = str(self.tmp / "video.mp4")
-
-        real_remove = os.remove
-
-        def _remove_then_vanish(path: Any) -> None:
-            real_remove(path)
-            raise FileNotFoundError(path)  # simulate a concurrent unlink
-
-        self._patch_object(os, "remove", _remove_then_vanish)
-        with self.assertRaises(ParallelDownloadUnavailable):
-            await dl.download_media(_make_message(len(blob)), dest)
-        self.assertFalse(os.path.exists(dest))
 
 
 # --------------------------------------------------------------------------- #
@@ -815,7 +808,7 @@ class TestBackupGating(_PatchHelpers, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Backup-layer seam (_fetch_media_bytes)
 # --------------------------------------------------------------------------- #
-class TestFetchMediaBytes(_PatchHelpers, unittest.IsolatedAsyncioTestCase):
+class TestFetchMediaBytes(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTestCase):
     async def test_fetch_media_bytes_uses_single_stream_when_disabled(self) -> None:
         backup = _make_backup(enabled=False)
         backup.client.download_media = AsyncMock(return_value="/tmp/out")
@@ -891,9 +884,308 @@ class TestFetchMediaBytes(_PatchHelpers, unittest.IsolatedAsyncioTestCase):
         await backup._fetch_media_bytes(msg, "/tmp/b", 50 * 1024 * 1024)
         self.assertEqual(build_count["n"], 1)
 
+    async def test_parallel_download_resumes_on_retry(self) -> None:
+        blob = os.urandom(524288 * 3)
 
-if __name__ == "__main__":
-    unittest.main()
+        class FlakyClient(FakeClient):
+            def __init__(self, blob: bytes) -> None:
+                super().__init__(blob)
+                self.attempts = 0
+
+            async def _call(self, sender: Any, request: Any) -> Any:
+                offset = request.offset
+                if offset == 524288 and self.attempts == 0:
+                    self.attempts += 1
+                    raise FloodWaitError(request=None)
+                return await super()._call(sender, request)
+
+        client = FlakyClient(blob)
+        self._patch_sender(client)
+
+        dl = ParallelDownloader(client, connections=2, part_size=524288)
+        dest = str(self.tmp / "resume_test.bin")
+
+        # First attempt: should raise FloodWaitError and preserve the partial file
+        with self.assertRaises(FloodWaitError):
+            await dl.download_media(_make_message(len(blob)), dest)
+
+        self.assertTrue(os.path.exists(dest))
+        self.assertIn(0, dl._completed_offsets[dest])
+        self.assertNotIn(524288, dl._completed_offsets[dest])
+
+        # Second attempt: should resume and finish successfully
+        await dl.download_media(_make_message(len(blob)), dest)
+        self.assertEqual(_read(dest), blob)
+        self.assertNotIn(dest, dl._completed_offsets)
+
+    async def test_call_with_flood_retry_resets_counter_on_progress(self) -> None:
+        from telegram_archive.telegram_backup import call_with_flood_retry
+
+        backup = _make_backup(enabled=True, min_mb=1)
+        dest = str(self.tmp / "progress_retry.bin")
+
+        class DummyDownloader:
+            def __init__(self) -> None:
+                self._completed_offsets = {dest: set()}
+
+        backup._parallel_downloader = DummyDownloader()  # type: ignore
+
+        call_count = [0]
+
+        async def mock_fetch(message: Any, path: str, size: int) -> str:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                backup._parallel_downloader._completed_offsets[dest].add(0)
+                raise FloodWaitError(request=None)
+            elif call_count[0] == 2:
+                backup._parallel_downloader._completed_offsets[dest].add(1)
+                raise FloodWaitError(request=None)
+            else:
+                backup._parallel_downloader._completed_offsets[dest].add(2)
+                return "done"
+
+        mock_fetch.__self__ = backup  # type: ignore
+
+        # Call with max_retries=1. If no reset, it would raise FloodWaitError on attempt 2.
+        # With reset, it should complete successfully and return "done".
+        result = await call_with_flood_retry(mock_fetch, "msg", dest, 3, max_retries=1)
+        self.assertEqual(result, "done")
+        self.assertEqual(call_count[0], 3)
+
+
+class TestNewParallelDownloadRequirements(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTestCase):
+    def test_get_completed_count(self) -> None:
+        client = FakeClient(b"x")
+        dl = ParallelDownloader(client, connections=4, part_size=524288)
+        dest = "/tmp/fake_dest.bin"
+        self.assertEqual(dl.get_completed_count(dest), 0)
+        dl._completed_offsets[dest] = {0, 524288}
+        self.assertEqual(dl.get_completed_count(dest), 2)
+
+    async def test_call_with_flood_retry_with_custom_progress_fn(self) -> None:
+        from telegram_archive.telegram_backup import call_with_flood_retry
+
+        called_progress = [0]
+
+        def custom_progress():
+            called_progress[0] += 1
+            return called_progress[0]
+
+        call_count = [0]
+
+        async def mock_fetch(message: Any, path: str, size: int) -> str:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise FloodWaitError(request=None)
+            return "done"
+
+        mock_fetch.__self__ = MagicMock()
+
+        result = await call_with_flood_retry(mock_fetch, "msg", "dest", 3, max_retries=2, progress_fn=custom_progress)
+        self.assertEqual(result, "done")
+        self.assertGreater(called_progress[0], 0)
+
+    async def test_call_with_flood_retry_fallback_to_get_completed_count(self) -> None:
+        from telegram_archive.telegram_backup import call_with_flood_retry
+
+        backup = _make_backup(enabled=True, min_mb=1)
+        dest = "/tmp/fallback_count.bin"
+
+        class DummyDownloader:
+            def __init__(self) -> None:
+                self.count = 0
+
+            def get_completed_count(self, path: str) -> int:
+                self.count += 1
+                return self.count
+
+        backup._parallel_downloader = DummyDownloader()  # type: ignore
+
+        call_count = [0]
+
+        async def mock_fetch(message: Any, path: str, size: int) -> str:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise FloodWaitError(request=None)
+            return "done"
+
+        mock_fetch.__self__ = backup  # type: ignore
+
+        result = await call_with_flood_retry(mock_fetch, "msg", dest, 3, max_retries=2)
+        self.assertEqual(result, "done")
+        self.assertGreater(backup._parallel_downloader.count, 0)
+
+    async def test_call_with_flood_retry_fallback_to_completed_offsets(self) -> None:
+        from telegram_archive.telegram_backup import call_with_flood_retry
+
+        backup = _make_backup(enabled=True, min_mb=1)
+        dest = "/tmp/fallback_offsets.bin"
+
+        class DummyOldDownloader:
+            def __init__(self) -> None:
+                self._completed_offsets = {dest: set()}
+
+        backup._parallel_downloader = DummyOldDownloader()  # type: ignore
+
+        call_count = [0]
+
+        async def mock_fetch(message: Any, path: str, size: int) -> str:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                backup._parallel_downloader._completed_offsets[dest].add(1)
+                raise FloodWaitError(request=None)
+            return "done"
+
+        mock_fetch.__self__ = backup  # type: ignore
+
+        result = await call_with_flood_retry(mock_fetch, "msg", dest, 3, max_retries=2)
+        self.assertEqual(result, "done")
+        self.assertEqual(len(backup._parallel_downloader._completed_offsets[dest]), 1)
+
+    async def test_download_media_resume_size_match_and_mismatch(self) -> None:
+        blob = os.urandom(524288 * 2)
+        client = FakeClient(blob)
+        self._patch_sender(client)
+        dl = ParallelDownloader(client, connections=2, part_size=524288)
+        dest = str(self.tmp / "test_size.bin")
+
+        # 1. Create file on disk with WRONG size first (e.g. 100 bytes)
+        with open(dest, "wb") as f:
+            f.write(b"x" * 100)
+
+        # Set some completed offsets manually
+        dl._completed_offsets[dest] = {0}
+
+        # Patch ftruncate to monitor calls
+        with patch("os.ftruncate", wraps=os.ftruncate) as mock_ftruncate:
+            await dl.download_media(_make_message(len(blob)), dest)
+            mock_ftruncate.assert_called_once()
+            self.assertEqual(_read(dest), blob)
+
+        # 2. Now let's test size MATCH with partial progress.
+        class FlakyClient(FakeClient):
+            def __init__(self, blob: bytes) -> None:
+                super().__init__(blob)
+                self.attempts = 0
+
+            async def _call(self, sender: Any, request: Any) -> Any:
+                if request.offset == 524288 and self.attempts == 0:
+                    self.attempts += 1
+                    raise FloodWaitError(request=None)
+                return await super()._call(sender, request)
+
+        client2 = FlakyClient(blob)
+        self._patch_sender(client2)
+        dl2 = ParallelDownloader(client2, connections=2, part_size=524288)
+        dest2 = str(self.tmp / "test_size_match.bin")
+
+        with self.assertRaises(FloodWaitError):
+            await dl2.download_media(_make_message(len(blob)), dest2)
+
+        self.assertEqual(os.path.getsize(dest2), len(blob))
+        self.assertEqual(dl2._completed_offsets[dest2], {0})
+
+        with patch("os.ftruncate", wraps=os.ftruncate) as mock_ftruncate2:
+            await dl2.download_media(_make_message(len(blob)), dest2)
+            mock_ftruncate2.assert_not_called()
+
+        self.assertEqual(_read(dest2), blob)
+
+    async def test_connect_sender_safe_disconnect_dummy_connection(self) -> None:
+        client = FakeClient(b"x")
+        dl = ParallelDownloader(client, connections=2, part_size=524288)
+
+        class FakeMTProtoSender:
+            def __init__(self, auth_key: Any, **kwargs: Any) -> None:
+                self.auth_key = auth_key
+                self.kwargs = kwargs
+                self._connection: Any = "live_conn"
+
+            async def _disconnect(self, error: Any = None) -> None:
+                self._connection = None
+
+            async def connect(self, connection: Any) -> None:
+                self._connection = connection
+
+        self._patch("telegram_archive.parallel_download.MTProtoSender", FakeMTProtoSender)
+        sender = await dl._connect_sender(2, "key")
+        await sender._disconnect()
+        self.assertIsNotNone(sender._connection)
+        await sender._connection.disconnect()
+        sender._connection.send(b"noop")
+        with self.assertRaises(asyncio.CancelledError):
+            await sender._connection.connect()
+        with self.assertRaises(asyncio.CancelledError):
+            await sender._connection.recv()
+
+    async def test_fetch_media_bytes_cleans_up_preallocated_file_and_offsets_on_fallback(self) -> None:
+        backup = _make_backup(enabled=True, min_mb=1)
+        dest = str(self.tmp / "fallback_sparse.part")
+
+        class _FailingParallelDL:
+            def __init__(self) -> None:
+                self._completed_offsets: dict[str, set[int]] = {}
+
+            async def download_media(self, message: Any, path: str) -> str:
+                with open(path, "wb") as f:
+                    f.truncate(50 * 1024 * 1024)
+                self._completed_offsets[path] = {0}
+                raise ParallelDownloadUnavailable("migrated")
+
+        dl_inst = _FailingParallelDL()
+        backup._parallel_downloader = dl_inst  # type: ignore
+
+        observed_exists_on_fallback: list[bool] = []
+
+        async def _single_stream(message: Any, path: str) -> str:
+            observed_exists_on_fallback.append(os.path.exists(path))
+            return path
+
+        backup.client.download_media = _single_stream  # type: ignore
+        result = await backup._fetch_media_bytes(_make_message(50 * 1024 * 1024), dest, 50 * 1024 * 1024)
+        self.assertEqual(result, dest)
+        self.assertEqual(observed_exists_on_fallback, [False])
+        self.assertNotIn(dest, dl_inst._completed_offsets)
+
+    async def test_call_with_flood_retry_resets_counter_on_transient_error_progress(self) -> None:
+        from telegram_archive.telegram_backup import call_with_flood_retry
+
+        self._patch("telegram_archive.telegram_backup.asyncio.sleep", AsyncMock())
+        self._patch("telegram_archive.telegram_backup._reconnect_before_retry", AsyncMock(return_value=False))
+
+        progress = [0]
+        calls = [0]
+
+        async def mock_fetch(message: Any, path: str, size: int) -> str:
+            calls[0] += 1
+            if calls[0] <= 2:
+                progress[0] += 1
+                raise ConnectionError("socket reset after chunk")
+            return "done"
+
+        result = await call_with_flood_retry(
+            mock_fetch,
+            "msg",
+            "dest",
+            3,
+            max_retries=1,
+            progress_fn=lambda: progress[0],
+        )
+        self.assertEqual(result, "done")
+        self.assertEqual(calls[0], 3)
+
+    async def test_download_media_clears_invalid_or_unaligned_completed_offsets(self) -> None:
+        blob = os.urandom(524288 * 2)
+        client = FakeClient(blob)
+        self._patch_sender(client)
+        dl = ParallelDownloader(client, connections=2, part_size=524288)
+        dest = str(self.tmp / "unaligned.bin")
+        with open(dest, "wb") as f:
+            f.truncate(len(blob))
+        # Pre-seed an invalid unaligned offset even though file size matches
+        dl._completed_offsets[dest] = {12345}
+        await dl.download_media(_make_message(len(blob)), dest)
+        self.assertEqual(_read(dest), blob)
 
 
 class TestSenderReuseAndConcurrency(_PatchHelpers, _TmpDirMixin, unittest.IsolatedAsyncioTestCase):
