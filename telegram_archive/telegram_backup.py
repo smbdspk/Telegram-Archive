@@ -2515,6 +2515,7 @@ class TelegramBackup:
 
         redownloaded = 0
         failed = 0
+        failed_per_chat: dict[int, int] = {}
 
         for chat_id, records in by_chat.items():
             # Skip media verification for chats in skip list
@@ -2534,6 +2535,7 @@ class TelegramBackup:
                 except Exception as e:
                     logger.warning(f"Cannot access chat for media verification: {e.__class__.__name__}")
                     failed += len(records)
+                    failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + len(records)
                     continue
 
                 # Create a map of message_id -> message
@@ -2550,11 +2552,13 @@ class TelegramBackup:
                     if not msg:
                         logger.warning("Message was deleted - cannot recover media")
                         failed += 1
+                        failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + 1
                         continue
 
                     if not msg.media:
                         logger.warning("Message no longer has media - cannot recover")
                         failed += 1
+                        failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + 1
                         continue
 
                     backup_path = None
@@ -2613,21 +2617,36 @@ class TelegramBackup:
                             logger.debug("Re-downloaded media for message")
                         else:
                             failed += 1
+                            failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + 1
                             await self._recover_failed_verification(record, backup_path)
                             logger.warning("Failed to re-download media for message")
                     except Exception as e:
                         failed += 1
+                        failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + 1
                         await self._recover_failed_verification(record, backup_path)
                         logger.error(f"Error re-downloading media for message: {describe_exception(e)}")
 
             except Exception as e:
                 logger.error(f"Error processing chat for media verification: {describe_exception(e)}")
                 failed += len(records)
+                failed_per_chat[chat_id] = failed_per_chat.get(chat_id, 0) + len(records)
 
         logger.info("=" * 60)
         logger.info("Media verification completed!")
         logger.info(f"Re-downloaded: {redownloaded} files")
         logger.info(f"Failed/Unrecoverable: {failed} files")
+        if failed_per_chat:
+            logger.info(f"Failures across {len(failed_per_chat)} chat(s):")
+            for rank, (cid, count) in enumerate(
+                sorted(failed_per_chat.items(), key=lambda x: x[1], reverse=True), start=1
+            ):
+                entity = None
+                if getattr(self.config, "log_chat_titles", False) is True:
+                    try:
+                        entity = await call_with_flood_retry(self.client.get_entity, cid)
+                    except Exception:
+                        entity = None
+                logger.info(f"  Chat #{rank}{chat_title_for_log(entity, self.config)}: {count} files")
         logger.info("=" * 60)
 
     async def _recover_failed_verification(self, record: dict, backup_path: str | None) -> None:

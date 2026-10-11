@@ -509,7 +509,7 @@ def _scanned_source_files() -> list[tuple[str, ast.AST]]:
     files: list[tuple[str, ast.AST]] = []
     for root in SCANNED_ROOTS:
         for path in sorted(root.rglob("*.py")):
-            rel = str(path.relative_to(REPO))
+            rel = path.relative_to(REPO).as_posix()
             if rel in CHAT_ID_LOG_ALLOWLIST:
                 continue
             files.append((rel, ast.parse(path.read_text(encoding="utf-8"), filename=str(path))))
@@ -663,7 +663,7 @@ class TestNoChatIdentifiersInLogs(unittest.TestCase):
         path = REPO / "telegram_archive" / "telegram_backup.py"
         source = path.read_text(encoding="utf-8")
         anchor = f"{TITLE_LOG_SINK}(entity, self.config)"
-        self.assertEqual(2, source.count(anchor), "both sanctioned call sites must use the exact anchor")
+        self.assertEqual(3, source.count(anchor), "all sanctioned call sites must use the exact anchor")
 
         self.assertEqual([], _violations_in_tree("telegram_archive/telegram_backup.py", ast.parse(source)))
         for replacement in ("entity.title", "chat_title", "self._get_marked_id(entity) or entity.title"):
@@ -687,10 +687,14 @@ class TestNoChatIdentifiersInLogs(unittest.TestCase):
                     argument = first.id if isinstance(first, ast.Name) else ast.dump(first) if first else "<none>"
                     calls.append(f"{rel}({argument})")
         self.assertEqual(
-            ["telegram_archive/telegram_backup.py(entity)", "telegram_archive/telegram_backup.py(entity)"],
+            [
+                "telegram_archive/telegram_backup.py(entity)",
+                "telegram_archive/telegram_backup.py(entity)",
+                "telegram_archive/telegram_backup.py(entity)",
+            ],
             sorted(calls),
-            "the title sink may be called only from the two progress lines, and only on `entity` — "
-            "`dialog` would name the person behind a private chat, because Dialog.title is their display name",
+            "the title sink may be called only from the two progress lines and media verification summary, "
+            "and only on `entity` — `dialog` would name the person behind a private chat, because Dialog.title is their display name",
         )
 
     def test_the_sanctioned_sink_is_bound_exactly_once(self) -> None:
