@@ -4733,27 +4733,35 @@ class DatabaseAdapter:
                 "content_hash": media.content_hash,
             }
 
-    async def get_media_for_chat(self, chat_id: int, *, account_id: int) -> list[dict[str, Any]]:
+    async def get_media_for_chat(self, chat_id: int, *, account_id: int | None = None) -> list[dict[str, Any]]:
         """
-        Get all media records for one account's copy of a chat.
+        Get all media records for one account's copy of a chat (or all accounts when ``account_id`` is None).
 
-        Feeds the chat-cleanup path that deletes files from disk, so it must
-        never surface another account's rows. The earlier media edits replaced
-        (``media_versions``) are listed too, with ``"version": True``:
-        ``delete_media_for_chat`` removes their rows as well.
+        Feeds the chat-cleanup path that deletes files from disk, so scoped
+        callers must pass ``account_id`` to avoid surfacing another account's
+        rows. The earlier media edits replaced (``media_versions``) are listed
+        too, with ``"version": True``: ``delete_media_for_chat`` removes their
+        rows as well.
 
         Args:
             chat_id: Chat identifier
+            account_id: Account identifier, or None to include all accounts
 
         Returns:
             List of media records with file paths and metadata
         """
         async with self.db_manager.async_session_factory() as session:
-            stmt = select(Media).where(and_(Media.account_id == account_id, Media.chat_id == chat_id))
+            stmt = select(Media).where(
+                and_(Media.account_id == account_id, Media.chat_id == chat_id)
+                if account_id is not None
+                else Media.chat_id == chat_id
+            )
             result = await session.execute(stmt)
             media_records = result.scalars().all()
             version_stmt = select(MediaVersion).where(
                 and_(MediaVersion.account_id == account_id, MediaVersion.chat_id == chat_id)
+                if account_id is not None
+                else MediaVersion.chat_id == chat_id
             )
             version_records = (await session.execute(version_stmt)).scalars().all()
 
@@ -5106,28 +5114,62 @@ class DatabaseAdapter:
                 "downloaded": media.downloaded,
             }
 
-    async def delete_media_for_chat(self, chat_id: int, *, account_id: int) -> int:
+    async def delete_media_for_chat(self, chat_id: int, *, account_id: int | None = None) -> int:
         """
-        Delete one account's media records for a specific chat.
+        Delete one account's (or all accounts' when ``account_id`` is None) media records for a specific chat.
         Does not delete message records or the chat itself.
 
         Args:
             chat_id: Chat identifier
+            account_id: Account identifier, or None to delete across all accounts
 
         Returns:
             Number of media records deleted
         """
         async with self.db_manager.async_session_factory() as session:
-            await self._delete_media_versions_of(
-                session,
-                and_(MediaVersion.account_id == account_id, MediaVersion.chat_id == chat_id),
-                account_id=account_id,
+            if account_id is not None:
+                await self._delete_media_versions_of(
+                    session,
+                    and_(MediaVersion.account_id == account_id, MediaVersion.chat_id == chat_id),
+                    account_id=account_id,
+                )
+                chat_media = and_(Media.account_id == account_id, Media.chat_id == chat_id)
+                await session.execute(self._delete_transcripts_of(chat_media, account_id=account_id))
+                result = await session.execute(delete(Media).where(chat_media))
+                await session.commit()
+                return result.rowcount
+
+            m_accs = (
+                (await session.execute(select(Media.account_id).where(Media.chat_id == chat_id).distinct()))
+                .scalars()
+                .all()
             )
-            chat_media = and_(Media.account_id == account_id, Media.chat_id == chat_id)
-            await session.execute(self._delete_transcripts_of(chat_media, account_id=account_id))
-            result = await session.execute(delete(Media).where(chat_media))
+            v_accs = (
+                (
+                    await session.execute(
+                        select(MediaVersion.account_id).where(MediaVersion.chat_id == chat_id).distinct()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            account_ids = sorted(set(m_accs) | set(v_accs))
+            if not account_ids:
+                return 0
+
+            total_deleted = 0
+            for acc_id in account_ids:
+                await self._delete_media_versions_of(
+                    session,
+                    and_(MediaVersion.account_id == acc_id, MediaVersion.chat_id == chat_id),
+                    account_id=acc_id,
+                )
+                chat_media = and_(Media.account_id == acc_id, Media.chat_id == chat_id)
+                await session.execute(self._delete_transcripts_of(chat_media, account_id=acc_id))
+                result = await session.execute(delete(Media).where(chat_media))
+                total_deleted += result.rowcount or 0
             await session.commit()
-            return result.rowcount
+            return total_deleted
 
     async def get_webpage_preview_documents(self, *, account_id: int) -> list[dict[str, Any]]:
         """One account's link-preview rows whose payload is a FILE, with the
@@ -5487,6 +5529,57 @@ class DatabaseAdapter:
             last_key = (rows[-1][0], rows[-1][1])
             if len(rows) < batch_size:
                 return
+
+    async def iter_all_media_file_paths(self, batch_size: int = 5000):
+        """Yield batches of all non-null ``Media.file_path`` and ``MediaVersion.file_path`` values.
+
+        Keyset-paginated on the primary key so memory stays bounded on large
+        archives. Includes kept historical media versions (``media_versions``)
+        so replaced media blobs in ``_shared/`` are preserved.
+        """
+        last_key: tuple[int, str] | None = None
+        while True:
+            async with self.db_manager.async_session_factory() as session:
+                stmt = (
+                    select(Media.account_id, Media.id, Media.file_path)
+                    .where(Media.file_path.isnot(None))
+                    .order_by(Media.account_id, Media.id)
+                    .limit(batch_size)
+                )
+                if last_key is not None:
+                    last_account, last_id = last_key
+                    stmt = stmt.where(
+                        or_(
+                            Media.account_id > last_account,
+                            and_(Media.account_id == last_account, Media.id > last_id),
+                        )
+                    )
+                rows = (await session.execute(stmt)).all()
+            if not rows:
+                break
+            yield [r[2] for r in rows]
+            last_key = (rows[-1][0], rows[-1][1])
+            if len(rows) < batch_size:
+                break
+
+        last_version_id: int | None = None
+        while True:
+            async with self.db_manager.async_session_factory() as session:
+                stmt = (
+                    select(MediaVersion.id, MediaVersion.file_path)
+                    .where(MediaVersion.file_path.isnot(None))
+                    .order_by(MediaVersion.id)
+                    .limit(batch_size)
+                )
+                if last_version_id is not None:
+                    stmt = stmt.where(MediaVersion.id > last_version_id)
+                rows = (await session.execute(stmt)).all()
+            if not rows:
+                break
+            yield [r[1] for r in rows]
+            last_version_id = rows[-1][0]
+            if len(rows) < batch_size:
+                break
 
     async def reset_chat_sync_cursor(self, chat_id: int) -> int:
         """Zero every account's sync cursor for one chat; chat rows changed.

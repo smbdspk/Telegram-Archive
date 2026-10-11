@@ -310,6 +310,30 @@ For more information, visit: https://github.com/GeiserX/Telegram-Archive
     details_parser.add_argument("-c", "--chat-id", type=int, help="Only this chat (default: every chat)")
     details_parser.add_argument("--apply", action="store_true", help="Write the changes (default: dry run)")
 
+    # Clean media command
+    clean_media_parser = subparsers.add_parser(
+        "clean-media",
+        help="Find and remove orphan media blobs in _shared/",
+        description=(
+            "Scans the _shared/ dedup store for blobs not referenced by any "
+            "database record and reports reclaimable space. Use --delete to "
+            "actually remove orphans."
+        ),
+    )
+    clean_media_parser.add_argument(
+        "--delete", action="store_true", help="Actually delete orphan blobs (default is dry-run/report only)"
+    )
+    clean_media_parser.add_argument(
+        "--purge-skipped",
+        action="store_true",
+        help="Remove per-chat symlinks and DB records for SKIP_MEDIA_CHAT_IDS chats (no Telegram API needed)",
+    )
+    clean_media_parser.add_argument(
+        "--include-dangling",
+        action="store_true",
+        help="Also detect and remove dangling symlinks in per-chat directories",
+    )
+
     return parser
 
 
@@ -513,6 +537,84 @@ async def run_import(args) -> int:
         return 0
     except Exception as e:
         print(f"Import failed: {e}", file=sys.stderr)
+        return 1
+
+
+async def run_clean_media(args) -> int:
+    """Run clean-media command."""
+    from .cleanup_media import clean_orphan_media, purge_skipped_chat_media
+    from .config import Config, setup_logging
+    from .db import close_database, get_adapter, init_database
+
+    try:
+        config = Config()
+        setup_logging(config)
+
+        await init_database()
+        db = await get_adapter()
+        try:
+            # Phase 1: purge per-chat media for SKIP_MEDIA_CHAT_IDS chats
+            purge_summary = None
+            if args.purge_skipped and config.skip_media_chat_ids:
+                purge_summary = await purge_skipped_chat_media(
+                    config.media_path,
+                    db,
+                    config.skip_media_chat_ids,
+                    delete=args.delete,
+                )
+
+            # Phase 2: orphan blob scan
+            # In dry-run, pass purged_realpaths so the orphan scan simulates
+            # the post-purge state (those DB references would be gone).
+            exclude = purge_summary.get("purged_realpaths") if purge_summary else None
+            summary = await clean_orphan_media(
+                config.media_path,
+                db,
+                delete=args.delete,
+                include_dangling=args.include_dangling,
+                exclude_realpaths=exclude,
+            )
+        finally:
+            await close_database()
+
+        mode = "DELETE" if args.delete else "DRY RUN"
+
+        # Print purge results
+        if purge_summary and purge_summary["media_records"] > 0:
+            print(f"\n[{mode}] Purge skipped chats (SKIP_MEDIA_CHAT_IDS):")
+            print(f"  Chats with media:          {purge_summary['chats_processed']}")
+            print(f"  Media DB records:          {purge_summary['media_records']}")
+            print(f"  Files (non-dedup):         {purge_summary['files_removed']}")
+            print(f"  Symlinks (dedup):          {purge_summary['symlinks_removed']}")
+            freed_mb = purge_summary["freed_bytes"] / (1024 * 1024)
+            print(f"  Direct space freed:        {freed_mb:.1f} MB")
+            if args.delete:
+                print(f"  DB records deleted:        {purge_summary['db_records_deleted']}")
+            if purge_summary["errors"]:
+                print(f"  Errors:                    {purge_summary['errors']}")
+        elif args.purge_skipped:
+            print(f"\n[{mode}] No media records found for SKIP_MEDIA_CHAT_IDS chats.")
+
+        # Print orphan scan results
+        print(f"\n[{mode}] Orphan media cleanup:")
+        print(f"  Total blobs in _shared/:   {summary['total_blobs']}")
+        print(f"  Referenced by DB:          {summary['referenced_blobs']}")
+        print(f"  Orphans found:             {summary['orphan_blobs']}")
+        orphan_mb = summary["orphan_bytes"] / (1024 * 1024)
+        print(f"  Reclaimable space:         {orphan_mb:.1f} MB")
+        if args.delete:
+            freed_mb = summary["freed_bytes"] / (1024 * 1024)
+            print(f"  Deleted:                   {summary['deleted_blobs']} blobs ({freed_mb:.1f} MB freed)")
+            if summary["errors"]:
+                print(f"  Errors:                    {summary['errors']}")
+        if args.include_dangling:
+            print(f"  Dangling symlinks:         {summary.get('dangling_symlinks', 0)}")
+            if args.delete and summary.get("deleted_dangling", 0):
+                print(f"  Dangling removed:          {summary['deleted_dangling']}")
+
+        return 0
+    except Exception as e:
+        print(f"Clean-media failed: {e}", file=sys.stderr)
         return 1
 
 
@@ -748,6 +850,8 @@ def main() -> int:
         return asyncio.run(run_import(args))
     elif args.command == "fill-gaps":
         return asyncio.run(run_fill_gaps_cmd(args))
+    elif args.command == "clean-media":
+        return asyncio.run(run_clean_media(args))
     else:
         parser.print_help()
         return 0
